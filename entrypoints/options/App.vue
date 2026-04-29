@@ -3,6 +3,8 @@ import { ref, onMounted } from 'vue';
 
 const apiKey = ref('');
 const apiProvider = ref('kimi');
+const customBaseUrl = ref('');
+const customModel = ref('');
 const tone = ref('diplomatic');
 const accent = ref('neutral');
 const customPrompt = ref('');
@@ -16,8 +18,10 @@ const saved = ref(false);
 
 const providers = [
   { value: 'kimi', label: 'Kimi (Moonshot)' },
-  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'grok', label: 'Grok (xAI)' },
   { value: 'openai', label: 'OpenAI' },
+  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'custom', label: 'Custom (OpenAI-compatible)' },
 ];
 
 const tones = [
@@ -53,12 +57,20 @@ const accents = [
   { value: 'meme', label: 'Internet Meme Style' },
   { value: 'poetic', label: 'Poetic' },
   { value: 'minimalist', label: 'Minimalist (Short & Punchy)' },
-  { value: 'saudi', label: 'Saudi / Gulf Arabic' },
-  { value: 'egyptian', label: 'Egyptian Arabic (Masri)' },
-  { value: 'levantine', label: 'Levantine Arabic (Shami)' },
-  { value: 'maghrebi', label: 'Maghrebi Arabic (Darija)' },
+  { value: 'saudi', label: 'Saudi Arabic' },
+  { value: 'emirati', label: 'Emirati Arabic' },
+  { value: 'kuwaiti', label: 'Kuwaiti Arabic' },
+  { value: 'qatari', label: 'Qatari Arabic' },
+  { value: 'bahraini', label: 'Bahraini Arabic' },
+  { value: 'omani', label: 'Omani Arabic' },
   { value: 'iraqi', label: 'Iraqi Arabic' },
+  { value: 'levantine', label: 'Levantine Arabic (Shami)' },
+  { value: 'egyptian', label: 'Egyptian Arabic (Masri)' },
+  { value: 'libyan', label: 'Libyan Arabic' },
+  { value: 'algerian', label: 'Algerian Darja' },
+  { value: 'maghrebi', label: 'Maghrebi Arabic (Darija)' },
   { value: 'formalArabic', label: 'Modern Standard Arabic (Fus\'ha)' },
+  { value: 'ethiopian', label: 'Amharic (Ethiopian)' },
 ];
 
 const lengths = [
@@ -71,10 +83,13 @@ onMounted(async () => {
   const stored = await browser.storage.local.get([
     'apiKey', 'apiProvider', 'tone', 'accent',
     'customPrompt', 'useCustomPrompt', 'monitorMode', 'keywords', 'replyLength',
-    'platformX', 'platformFacebook'
+    'platformX', 'platformFacebook',
+    'customBaseUrl', 'customModel',
   ]);
   if (stored.apiKey) apiKey.value = stored.apiKey as string;
   if (stored.apiProvider) apiProvider.value = stored.apiProvider as string;
+  if (stored.customBaseUrl) customBaseUrl.value = stored.customBaseUrl as string;
+  if (stored.customModel) customModel.value = stored.customModel as string;
   if (stored.tone) tone.value = stored.tone as string;
   if (stored.accent) accent.value = stored.accent as string;
   if (stored.customPrompt) customPrompt.value = stored.customPrompt as string;
@@ -90,6 +105,8 @@ async function saveSettings() {
   await browser.storage.local.set({
     apiKey: apiKey.value.trim(),
     apiProvider: apiProvider.value,
+    customBaseUrl: customBaseUrl.value.trim(),
+    customModel: customModel.value.trim(),
     tone: tone.value,
     accent: accent.value,
     customPrompt: customPrompt.value,
@@ -139,6 +156,18 @@ async function testConnection() {
       <label>API Key</label>
       <input type="password" v-model="apiKey" placeholder="Enter your API key..." />
       <p class="hint">Your API key is stored locally and never leaves your browser except to call the selected provider.</p>
+    </div>
+
+    <div v-if="apiProvider === 'custom'" class="field">
+      <label>Custom Base URL</label>
+      <input type="text" v-model="customBaseUrl" placeholder="https://api.example.com/v1" />
+      <p class="hint">OpenAI-compatible base URL. The extension will POST to <code>&lt;base&gt;/chat/completions</code>.</p>
+    </div>
+
+    <div v-if="apiProvider === 'custom'" class="field">
+      <label>Custom Model Name</label>
+      <input type="text" v-model="customModel" placeholder="model-id-as-the-provider-expects" />
+      <p class="hint">Exact model identifier as the provider's API expects it.</p>
     </div>
 
     <div class="field">
@@ -208,15 +237,15 @@ async function testConnection() {
       />
     </div>
 
+    <div class="info">
+      <p><strong>How to use:</strong> Navigate to X or Facebook, find the <strong>AI Reply</strong> button next to posts, and click it to generate a reply.</p>
+    </div>
+
     <div class="actions">
       <button class="save-btn" @click="saveSettings">
         {{ saved ? 'Saved!' : 'Save' }}
       </button>
       <button class="test-btn" @click="testConnection">Test Connection</button>
-    </div>
-
-    <div class="info">
-      <p><strong>How to use:</strong> Navigate to X or Facebook, find the <strong>AI Reply</strong> button next to posts, and click it to generate a reply.</p>
     </div>
   </div>
 </template>
@@ -286,7 +315,13 @@ select:focus, input:focus, textarea:focus {
 .actions {
   display: flex;
   gap: 10px;
-  margin-bottom: 1.25rem;
+  position: sticky;
+  bottom: 0;
+  background: #242424;
+  padding: 14px 0 16px;
+  margin-top: 0.75rem;
+  border-top: 1px solid #38444d;
+  z-index: 10;
 }
 .actions button {
   flex: 1;

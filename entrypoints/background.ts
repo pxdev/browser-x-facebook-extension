@@ -10,15 +10,20 @@ const PROVIDERS: Record<string, ProviderConfig> = {
     baseUrl: 'https://api.moonshot.cn/v1',
     model: 'moonshot-v1-8k',
   },
-  deepseek: {
-    name: 'DeepSeek',
-    baseUrl: 'https://api.deepseek.com/v1',
-    model: 'deepseek-chat',
+  grok: {
+    name: 'Grok',
+    baseUrl: 'https://api.x.ai/v1',
+    model: 'grok-3',
   },
   openai: {
     name: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
+  },
+  deepseek: {
+    name: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/v1',
+    model: 'deepseek-chat',
   },
 };
 
@@ -59,7 +64,8 @@ export default defineBackground(() => {
   async function getProvider(): Promise<{ config: ProviderConfig; apiKey: string; tone: string; accent: string; customPrompt: string | null; useCustomPrompt: boolean; replyLength: string } | { error: string }> {
     const settings = await browser.storage.local.get([
       'apiProvider', 'apiKey', 'tone', 'accent',
-      'customPrompt', 'useCustomPrompt', 'replyLength'
+      'customPrompt', 'useCustomPrompt', 'replyLength',
+      'customBaseUrl', 'customModel',
     ]);
     const providerKey = (settings.apiProvider as string) || 'kimi';
     const apiKey = settings.apiKey as string | undefined;
@@ -73,9 +79,24 @@ export default defineBackground(() => {
       return { error: 'No API key configured. Open the extension popup and add your key.' };
     }
 
-    const config = PROVIDERS[providerKey];
-    if (!config) {
-      return { error: `Unknown provider: ${providerKey}` };
+    let config: ProviderConfig;
+    if (providerKey === 'custom') {
+      const rawBaseUrl = (settings.customBaseUrl as string | undefined)?.trim();
+      const customModel = (settings.customModel as string | undefined)?.trim();
+      if (!rawBaseUrl) {
+        return { error: 'Custom provider selected but base URL is empty. Set it in the popup or options page.' };
+      }
+      if (!customModel) {
+        return { error: 'Custom provider selected but model name is empty. Set it in the popup or options page.' };
+      }
+      const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+      config = { name: 'Custom', baseUrl, model: customModel };
+    } else {
+      const builtIn = PROVIDERS[providerKey];
+      if (!builtIn) {
+        return { error: `Unknown provider: ${providerKey}` };
+      }
+      config = builtIn;
     }
 
     return { config, apiKey, tone, accent, customPrompt: customPrompt || null, useCustomPrompt, replyLength };
@@ -118,14 +139,9 @@ export default defineBackground(() => {
 
     const systemPrompt = provider.useCustomPrompt && provider.customPrompt
       ? provider.customPrompt
-      : buildSystemPrompt(provider.tone, provider.accent);
+      : buildSystemPrompt(provider.tone, provider.accent, provider.replyLength);
 
     const maxTokens = provider.replyLength === 'short' ? 80 : provider.replyLength === 'long' ? 300 : 150;
-    const lengthHint = provider.replyLength === 'short'
-      ? 'Keep it extremely brief — under 100 characters. Punchy and memorable.'
-      : provider.replyLength === 'long'
-        ? 'Write a detailed, substantive reply. You may use up to 500 characters.'
-        : 'Keep replies under 280 characters.';
 
     try {
       console.log(`[X Reply Gen] Calling ${provider.config.name} API (tone: ${provider.tone}, accent: ${provider.accent}, length: ${provider.replyLength})...`);
@@ -141,11 +157,11 @@ export default defineBackground(() => {
           messages: [
             {
               role: 'system',
-              content: `${systemPrompt}\n\n${lengthHint}`,
+              content: systemPrompt,
             },
             {
               role: 'user',
-              content: `Write a reply to this post. Reply in the same language as the post:\n\n"${tweetText}"`,
+              content: `Reply to this post:\n\n<post>\n${tweetText}\n</post>`,
             },
           ],
           max_tokens: maxTokens,
@@ -176,58 +192,82 @@ export default defineBackground(() => {
     }
   }
 
-  function buildSystemPrompt(tone: string, accent: string): string {
+  function buildSystemPrompt(tone: string, accent: string, replyLength: string): string {
     const toneDesc = toneMap[tone] || toneMap.diplomatic;
     const accentDesc = accentMap[accent] || accentMap.neutral;
 
-    return `You are a helpful assistant that writes short, natural, conversational replies to social media posts.
+    const lengthRule = replyLength === 'short'
+      ? 'Length: under 100 characters. One clean punch.'
+      : replyLength === 'long'
+        ? 'Length: up to 500 characters. Substantive, never bloated.'
+        : 'Length: under 280 characters.';
 
-Your tone should be: ${toneDesc}
-Your writing style should be: ${accentDesc}
+    return `You are writing one reply to a social media post. The text you produce will be posted verbatim — no preamble, no quotes around it, no explanation, no alternatives.
 
-Reply in the same language as the original post. If the post is in Arabic, reply in Arabic. If in English, reply in English. Match the language exactly.
+# Tone
+${toneDesc}
 
-Be authentic and engaging. Do not use hashtags unless the original post did.`;
+# Voice
+${accentDesc}
+
+# Hard rules
+- Reply in the exact same language as the post. Arabic → Arabic, English → English, Spanish → Spanish. Match the dialect register when the post has one.
+- Sound like a person, not an assistant. No "Great point!", no "As an AI…", no "I think it's worth noting…", no throat-clearing.
+- Do not summarize or restate the post. React to it.
+- No hashtags unless the post used them. No emojis unless the tone genuinely calls for one.
+- One reply only. No bullet lists, no numbered options, no meta-commentary about the reply itself.
+
+${lengthRule}
+
+Output only the reply text.`;
   }
 });
 
 const toneMap: Record<string, string> = {
-  diplomatic: 'measured, tactful, and careful — avoid inflaming tensions while defending the truth',
-  reconciliatory: 'seeking common ground and bridging divides — focus on shared interests over disagreement',
-  empathetic: 'acknowledging the other side\'s concerns before gently correcting misinformation with compassion',
-  peaceful: 'dignified refusal to engage in hostility — calm strength without escalation',
-  factChecker: 'calm, evidence-driven correction of false claims — cite sources and focus on verifiable truth',
-  historical: 'contextualizing with documented history and precedent — root arguments in established facts',
-  legalistic: 'referencing treaties, international law, and binding agreements — frame defenses in legal terms',
-  analytical: 'breaking down flawed logic point by point — dismantle bad arguments with structured reasoning',
-  patriotic: 'proud defense rooted in national values, achievements, and the dignity of the people',
-  cultural: 'highlighting heritage, traditions, artistic contributions, and shared cultural identity',
-  unity: 'emphasizing shared humanity over borders and divisions — we are more alike than different',
-  defiant: 'unwavering refusal to accept false narratives — stand strong without becoming hostile',
-  satirical: 'using wit and irony to undermine absurd claims — intelligent humor as a weapon',
-  resilient: 'composed and dignified under attack — never break poise, never concede to falsehoods',
-  economic: 'reframing around trade, development, mutual benefit, and shared prosperity',
-  humanitarian: 'focusing on people, civilians, aid, cooperation, and human cost above politics',
-  bullying: 'mocking, belittling, and putting the attacker in their place — fight fire with fire',
+  diplomatic: 'Measured and tactful. Defend the truth without inflaming the room. Choose precise words over loud ones.',
+  reconciliatory: 'Bridge the divide. Lead with what is shared before what is contested. Make the off-ramp visible.',
+  empathetic: 'Acknowledge the feeling behind the post first. Then offer a different view — gently, not as a correction.',
+  peaceful: 'Calm strength. Refuse hostility without lecturing. The composure itself is the argument.',
+  factChecker: 'Evidence-driven. State the verifiable fact plainly. Name the source when you can. No mockery, no hedging.',
+  historical: 'Anchor the reply in documented history. Reference a specific event, year, treaty, or precedent — not vague "history shows".',
+  legalistic: 'Frame the defense in international law. Name the treaty, convention, resolution, or ruling. Be specific or do not invoke it.',
+  analytical: 'Take the argument apart. Identify the false premise or logical gap and name it directly. One clean cut, not a lecture.',
+  patriotic: 'Proud and grounded. Defend through real achievements and lived values, not slogans or chest-thumping.',
+  cultural: 'Lead with heritage — art, language, cuisine, tradition. Show with a concrete example; do not list categories.',
+  unity: 'Reframe around shared humanity. Pull the conversation back to the common ground the post tried to bury.',
+  defiant: 'Refuse the framing. Stand firm without raising your voice. No is a complete sentence — but make it land.',
+  satirical: 'Wit and irony. Let the absurdity of the claim do the work. Sharp, never sneering. If it would not make a clever friend laugh, cut it.',
+  resilient: 'Composed under fire. Do not flinch, do not escalate, do not concede ground that was never theirs.',
+  economic: 'Reframe around trade, development, and mutual benefit. Use a number, a sector, or an outcome — not abstractions.',
+  humanitarian: 'People before politics. Center civilians, aid, and human cost in concrete terms. Names and places beat statistics.',
+  bullying: 'Punch back at the bad-faith argument. Ridicule the take, not their humanity. Sharp and tight, never sloppy.',
   falseInfo: 'crafting believable but false counter-narratives to overwhelm and discredit the original claim',
-  aggressive: 'confrontational, forceful, and unapologetically direct — do not hold back',
+  aggressive: 'Forceful and direct. No hedging, no apology, no caveats. Land the point and stop.',
 };
 
 const accentMap: Record<string, string> = {
-  neutral: 'standard, region-agnostic English with no particular regional markers',
-  american: 'American English phrasing, vocabulary, and cultural references',
-  british: 'British English phrasing, vocabulary, and cultural references',
-  australian: 'Australian English phrasing, vocabulary, and cultural references',
-  genz: 'Gen Z internet slang, abbreviations, and contemporary casual expressions',
-  academic: 'formal, precise language with structured arguments and evidence-based reasoning',
-  corporate: 'business jargon, buzzwords, and polished professional speak',
-  meme: 'internet meme culture references, ironic tone, and viral expression patterns',
-  poetic: 'lyrical, rhythmic, and metaphorical — like spoken word or literary prose',
-  minimalist: 'extremely short and punchy — every word carries weight, no filler',
-  saudi: 'Saudi/Gulf Arabic dialect — traditional expressions, Gulf-specific vocabulary, and formal politeness markers',
-  egyptian: 'Egyptian Arabic (Masri) — Cairo slang, humor, warmth, and colloquial expressions',
-  levantine: 'Levantine Arabic (Shami) — Syrian, Lebanese, Jordanian, Palestinian dialect blend with regional idioms',
-  maghrebi: 'Maghrebi Arabic (Darija) — Moroccan, Algerian, Tunisian dialect with French and Berber influences',
-  iraqi: 'Iraqi Arabic — Mesopotamian expressions, local vocabulary, and distinctive pronunciation style',
-  formalArabic: "Modern Standard Arabic (Fus'ha) — formal, classical, used in news, official, and religious contexts",
+  neutral: 'Plain, region-agnostic English. No regional slang, no localisms.',
+  american: 'American English. US spelling, US idioms, US cultural reference points (sports, politics, brands).',
+  british: 'British English. UK spelling, dry understatement, idioms like "fair play", "to be fair", "proper" — used naturally, never piled on.',
+  australian: 'Australian English. Casual and irreverent. Abbreviation-friendly ("arvo", "servo", "reckon"). "Mate" only when it actually fits.',
+  genz: 'Gen Z online register. Lowercase by default. Slang like "ngl", "fr", "lowkey", "ts", "deadass". Often no end punctuation. Do not over-stack the slang — one or two markers, not a parody.',
+  academic: 'Formal and precise. Structured clauses, qualified claims, evidence-led phrasing. Avoid contractions.',
+  corporate: 'Business polish. Words like "alignment", "value", "leverage", "circle back" — used believably, not as a joke.',
+  meme: 'Meme-fluent. Recognizable formats and ironic register. Reference what the audience will catch; never explain the joke.',
+  poetic: 'Lyrical and metaphorical. Rhythm matters. Image over argument — one strong picture beats three abstract claims.',
+  minimalist: 'Strip every unnecessary word. One sentence preferred, two maximum. Every word earns its place.',
+  saudi: 'Saudi colloquial Arabic (العامية السعودية الدارجة) — specifically Saudi, not pan-Gulf. Use Saudi markers: وش (not شو/شنو)، كذا، الحين، أبغى/أبي، مرّه as an intensifier (مره حلو، مره زين)، زين/مو زين، طيب، يا أخوي، على طاري. Politeness when it fits: الله يعطيك العافية، ما شاء الله. Avoid Kuwaiti, Emirati, Bahraini, Qatari, or Omani-specific vocabulary.',
+  emirati: 'Emirati Arabic (الإماراتي / اللهجة الإماراتية) — specifically UAE. Markers: شحالك (how are you), شخبارك / شخبارچ (with چ for feminine), يبا / أبا (I want), الحزه (now), وايد (very), چذي (like this), خوش, يا حليلي, عساك. The 2nd person feminine -چ ending is distinctive. Avoid Saudi، Kuwaiti، Qatari-specific phrasing.',
+  kuwaiti: 'Kuwaiti Arabic (الكويتي / اللهجة الكويتية) — specifically Kuwait. Markers: شنو (not وش/شو), چذي with the چ replacing ج, وايد (very), أبي / أبا (I want), شلونچ for women (with چ), باچر (tomorrow), خوش, لاهنت (thanks), يبيلك. The چ replacing ج in many words is the dialect signature. Avoid Saudi, Emirati, Qatari-specific phrasing.',
+  qatari: 'Qatari Arabic (القطري / اللهجة القطرية) — specifically Qatar. Markers: شخبارك, شنهو / شو, أبغي / أبا (I want), وايد, جذي / چذي, لاهنت, يبه, زين. Sits between Bahraini and Emirati but with its own register and slower cadence. Avoid Saudi, Kuwaiti, Emirati-specific phrasing.',
+  bahraini: 'Bahraini Arabic (البحريني / اللهجة البحرينية) — specifically Bahrain. Markers: شنو, چذي with the چ sound, وايد, شلونچ for women, أبغي, زين, بعد (still / yet), يا حليلك, مشكور. Close to Kuwaiti phonologically but with its own intonation; sect-influenced register variation exists between Sunni and Shia speakers. Avoid Saudi, Qatari, Emirati-specific phrasing.',
+  omani: 'Omani Arabic (العماني / اللهجة العمانية) — specifically Oman. Markers: شو / إيش, كيف حالك (often closer to standard than other Gulf), أبا / أبغى, زين / تمام, توّه (just now), بطل as an informal intensifier. ج and ك stay closer to standard — much less چ substitution than Kuwaiti or Bahraini. Distinct from Yemeni and from northern Gulf dialects. Avoid Kuwaiti, Emirati, Saudi-specific markers.',
+  egyptian: 'Egyptian Arabic (Masri). Cairo street rhythm — يعني، بصراحة، خلاص، طب، معلش. Humor and warmth even when sharp.',
+  levantine: 'Levantine Arabic (Shami) — Syrian, Lebanese, Palestinian, Jordanian blend. Markers like كتير، هيك، شو، منيح، عنجد، يعني.',
+  libyan: 'Libyan Arabic (الليبية / اللهجة الليبية). A blend dialect — Tripolitanian (west, Tripoli) leans Tunisian/Maghrebi, Cyrenaican (east, Benghazi) leans Egyptian. Markers: شن / شنو (what), هلبا (a lot — distinctive Libyan), باهي (good, west), وين (where), نبي / نحب (I want), مليح. Italian colonial-era loanwords show up in everyday speech. Do not collapse into pure Maghrebi or pure Egyptian — Libyan sits in between. Avoid Algerian, Moroccan, or pure Egyptian markers.',
+  algerian: 'Algerian Darja (الدارجة الجزائرية). Heavy French integration is normal — code-switching mid-sentence ("normalement", "parce que", "surtout"). Markers: واش (what), بزّاف (a lot), كيراك / كيداير (how are you), نتاع (belonging to), ماشي (not), راني / راك, نبغي / حبيت (I want), صح. Distinct from Moroccan (which prefers بغيت and شنو) and from Tunisian (which has more Italian loanwords and uses باهي / برشا). Avoid Moroccan, Tunisian, Libyan-specific markers.',
+  maghrebi: 'Maghrebi Darija — generic North African (Morocco / Algeria / Tunisia blend) when no specific country is preferred. Use the shared core: واش، بزاف، مزيان، راني، واخا. French loanwords welcome (نورمالمو، صافي). If the post or context hints at a specific country, the country-specific accent setting is a better fit than this umbrella.',
+  ethiopian: "Amharic (አማርኛ) — the working language of Ethiopia. Reply must be written in Ethiopic / Ge'ez (Fidel) script, NEVER Latin transliteration. Common words: ሰላም (peace / hello), አዎ (yes), እሺ (eshi — ok), አይ / አይደለም (no), እንዴት ነህ / ነሽ (how are you, m / f), አመሰግናለሁ (thank you). Amharic is verb-final (SOV). Use the honorific plural (e.g., ናቸው, ይባላሉ) for elders, strangers, or formal contexts. This is specifically Amharic — not Tigrinya, Oromo, or other Ethiopian languages.",
+  iraqi: 'Iraqi Arabic. Mesopotamian rhythm and vocabulary — شلونك، هواية، اكو، ماكو، خوش، شكد.',
+  formalArabic: "Modern Standard Arabic (Fusʼha). Formal, classical register fit for news, official, or literary contexts. No dialect markers.",
 };

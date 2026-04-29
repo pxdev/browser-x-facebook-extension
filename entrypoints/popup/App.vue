@@ -3,6 +3,8 @@ import { ref, onMounted } from 'vue';
 
 const apiKey = ref('');
 const apiProvider = ref('kimi');
+const customBaseUrl = ref('');
+const customModel = ref('');
 const tone = ref('diplomatic');
 const accent = ref('neutral');
 const customPrompt = ref('');
@@ -19,8 +21,10 @@ const detectedCount = ref(0);
 
 const providers = [
   { value: 'kimi', label: 'Kimi (Moonshot)' },
-  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'grok', label: 'Grok (xAI)' },
   { value: 'openai', label: 'OpenAI' },
+  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'custom', label: 'Custom (OpenAI-compatible)' },
 ];
 
 const tones = [
@@ -56,12 +60,20 @@ const accents = [
   { value: 'meme', label: 'Internet Meme Style' },
   { value: 'poetic', label: 'Poetic' },
   { value: 'minimalist', label: 'Minimalist (Short & Punchy)' },
-  { value: 'saudi', label: 'Saudi / Gulf Arabic' },
-  { value: 'egyptian', label: 'Egyptian Arabic (Masri)' },
-  { value: 'levantine', label: 'Levantine Arabic (Shami)' },
-  { value: 'maghrebi', label: 'Maghrebi Arabic (Darija)' },
+  { value: 'saudi', label: 'Saudi Arabic' },
+  { value: 'emirati', label: 'Emirati Arabic' },
+  { value: 'kuwaiti', label: 'Kuwaiti Arabic' },
+  { value: 'qatari', label: 'Qatari Arabic' },
+  { value: 'bahraini', label: 'Bahraini Arabic' },
+  { value: 'omani', label: 'Omani Arabic' },
   { value: 'iraqi', label: 'Iraqi Arabic' },
+  { value: 'levantine', label: 'Levantine Arabic (Shami)' },
+  { value: 'egyptian', label: 'Egyptian Arabic (Masri)' },
+  { value: 'libyan', label: 'Libyan Arabic' },
+  { value: 'algerian', label: 'Algerian Darja' },
+  { value: 'maghrebi', label: 'Maghrebi Arabic (Darija)' },
   { value: 'formalArabic', label: 'Modern Standard Arabic (Fus\'ha)' },
+  { value: 'ethiopian', label: 'Amharic (Ethiopian)' },
 ];
 
 const lengths = [
@@ -78,10 +90,13 @@ onMounted(async () => {
   const stored = await browser.storage.local.get([
     'apiKey', 'apiProvider', 'tone', 'accent',
     'customPrompt', 'useCustomPrompt', 'monitorMode', 'keywords', 'replyLength', 'detectedCount',
-    'platformX', 'platformFacebook'
+    'platformX', 'platformFacebook',
+    'customBaseUrl', 'customModel',
   ]);
   if (stored.apiKey) apiKey.value = stored.apiKey as string;
   if (stored.apiProvider) apiProvider.value = stored.apiProvider as string;
+  if (stored.customBaseUrl) customBaseUrl.value = stored.customBaseUrl as string;
+  if (stored.customModel) customModel.value = stored.customModel as string;
   if (stored.tone) tone.value = stored.tone as string;
   if (stored.accent) accent.value = stored.accent as string;
   if (stored.customPrompt) customPrompt.value = stored.customPrompt as string;
@@ -98,6 +113,8 @@ async function saveSettings() {
   await browser.storage.local.set({
     apiKey: apiKey.value.trim(),
     apiProvider: apiProvider.value,
+    customBaseUrl: customBaseUrl.value.trim(),
+    customModel: customModel.value.trim(),
     tone: tone.value,
     accent: accent.value,
     customPrompt: customPrompt.value,
@@ -151,6 +168,16 @@ async function testConnection() {
     <div class="field">
       <label>API Key</label>
       <input type="password" v-model="apiKey" placeholder="Enter your API key..." />
+    </div>
+
+    <div v-if="apiProvider === 'custom'" class="field">
+      <label>Custom Base URL</label>
+      <input type="text" v-model="customBaseUrl" placeholder="https://api.example.com/v1" />
+    </div>
+
+    <div v-if="apiProvider === 'custom'" class="field">
+      <label>Custom Model Name</label>
+      <input type="text" v-model="customModel" placeholder="model-id" />
     </div>
 
     <div class="field">
@@ -230,19 +257,12 @@ async function testConnection() {
       <button class="test-btn" @click="testConnection">Test</button>
     </div>
 
-    <div class="status" :class="{ active: isOnX }">
-      <span class="dot"></span>
-      {{ isOnX ? 'Ready' : 'Navigate to X or Facebook' }}
-    </div>
-
-    <button v-if="!isOnX" class="goto-btn" @click="goToX">Go to X.com</button>
   </div>
 </template>
 
 <style scoped>
 .popup {
   width: 320px;
-  padding: 1rem;
   font-family: system-ui, -apple-system, sans-serif;
   color: #e7e9ea;
 }
@@ -298,7 +318,13 @@ select:focus, input:focus, textarea:focus {
 .actions {
   display: flex;
   gap: 8px;
-  margin-bottom: 0.75rem;
+  position: sticky;
+  bottom: 0;
+  background: #242424;
+  padding: 10px 0 12px;
+  margin-top: 0.5rem;
+  border-top: 1px solid #38444d;
+  z-index: 10;
 }
 .actions button {
   flex: 1;

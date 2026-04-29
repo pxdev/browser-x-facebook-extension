@@ -206,7 +206,7 @@ export default defineContentScript({
         let candidates: Element[] = [];
 
         // Gather from all scopes + shadow DOMs
-        const scopes: (Element | Document | null)[] = [
+        const scopes: (Element | Document | null | undefined)[] = [
           postEl,
           postEl?.nextElementSibling,
           postEl?.parentElement,
