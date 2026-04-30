@@ -1,3 +1,7 @@
+import { t, initLocale } from '../utils/i18n';
+import { mountIntelPanel, type PanelTarget } from '../utils/intel-panel';
+import type { Platform } from '../utils/db';
+
 export default defineContentScript({
   matches: [
     'https://x.com/*',
@@ -8,6 +12,7 @@ export default defineContentScript({
   ],
   async main() {
     console.log('[X Reply Gen] Content script active on', location.hostname);
+    await initLocale();
 
     const platform = detectPlatform();
     const settings = await browser.storage.local.get(['enabled', 'monitorMode', 'keywords', 'platformX', 'platformFacebook']);
@@ -25,8 +30,25 @@ export default defineContentScript({
       return;
     }
 
-    const monitorMode = settings.monitorMode as boolean || false;
-    const keywords = parseKeywords(settings.keywords as string);
+    const monitorState = {
+      enabled: !!settings.monitorMode,
+      keywords: parseKeywords(settings.keywords as string),
+      watchlists: [] as Array<{ id: number; kind: 'account' | 'keyword'; value: string }>,
+    };
+
+    async function loadWatchlistsCache() {
+      const stored = await browser.storage.local.get(['watchlistsCache']);
+      monitorState.watchlists = (stored.watchlistsCache as typeof monitorState.watchlists) || [];
+    }
+    loadWatchlistsCache();
+
+    browser.storage.onChanged.addListener((changes) => {
+      if (changes.monitorMode) monitorState.enabled = !!changes.monitorMode.newValue;
+      if (changes.keywords) monitorState.keywords = parseKeywords(changes.keywords.newValue as string);
+      if (changes.watchlistsCache) monitorState.watchlists = (changes.watchlistsCache.newValue as typeof monitorState.watchlists) || [];
+    });
+
+    const monitorSeen = new WeakSet<HTMLElement>();
 
     function detectPlatform(): 'x' | 'facebook' {
       if (location.hostname.includes('x.com') || location.hostname.includes('twitter.com')) return 'x';
@@ -61,15 +83,157 @@ export default defineContentScript({
       return { text: bestText };
     }
 
-    function scorePost(text: string): number {
-      if (keywords.length === 0) return 0;
+    function matchedKeywords(text: string, list: string[]): string[] {
+      if (!list.length) return [];
       const lower = text.toLowerCase();
-      let score = 0;
-      for (const kw of keywords) {
-        if (lower.includes(kw)) score += 1;
-      }
-      return score;
+      return list.filter((kw) => lower.includes(kw));
     }
+
+    const POSITIVE_MARKERS = ['❤️', '💚', '🎉', '👍', '✨', '💯', '🔥', 'love', 'great', 'amazing', 'excellent', 'good', 'nice', 'beautiful', 'awesome', 'congrats', 'ممتاز', 'رائع', 'حلو', 'جميل', 'تمام', 'يعطيك العافية'];
+    const NEGATIVE_MARKERS = ['😠', '😡', '💔', '👎', '🤮', 'hate', 'terrible', 'awful', 'stupid', 'disgusting', 'horrible', 'worst', 'سيء', 'فظيع', 'مقرف', 'كارثة', 'مصيبة'];
+
+    function quickSentiment(text: string): 'positive' | 'negative' | 'neutral' {
+      const lower = text.toLowerCase();
+      let pos = 0; let neg = 0;
+      for (const m of POSITIVE_MARKERS) if (lower.includes(m)) pos++;
+      for (const m of NEGATIVE_MARKERS) if (lower.includes(m)) neg++;
+      if (pos > neg) return 'positive';
+      if (neg > pos) return 'negative';
+      return 'neutral';
+    }
+
+    function highlightMatched(postEl: HTMLElement) {
+      if (postEl.dataset.xrgHighlight === '1') return;
+      postEl.dataset.xrgHighlight = '1';
+      postEl.style.outline = '2px solid #ffb700';
+      postEl.style.outlineOffset = '-2px';
+      postEl.style.borderRadius = '12px';
+    }
+
+    function monitorPost(postEl: HTMLElement, platformKind: 'x' | 'facebook') {
+      if (monitorSeen.has(postEl)) return;
+      const { text } = extractPostData(postEl, platformKind);
+      if (!text || text.length < 4) return;
+      monitorSeen.add(postEl);
+
+      const author = extractAuthor(postEl, platformKind);
+      const permalink = findPostPermalink(postEl, platformKind) || undefined;
+
+      // 1) Narrative tracker: log every keyword hit if monitorMode is on.
+      if (monitorState.enabled && monitorState.keywords.length > 0) {
+        const hits = matchedKeywords(text, monitorState.keywords);
+        if (hits.length > 0) {
+          highlightMatched(postEl);
+          const sentimentQuick = quickSentiment(text);
+          for (const kw of hits) {
+            browser.runtime.sendMessage({
+              type: 'NARRATIVE_HIT',
+              row: {
+                ts: Date.now(),
+                platform: platformKind,
+                keyword: kw,
+                text: text.slice(0, 1000),
+                author: author?.name || author?.handle,
+                postUrl: permalink,
+                sentimentQuick,
+              },
+            }).catch(() => { /* ignore */ });
+          }
+        }
+      }
+
+      // 2) Watchlists: account or keyword matches.
+      if (monitorState.watchlists.length > 0) {
+        const lowerText = text.toLowerCase();
+        const lowerAuthorName = author?.name?.toLowerCase() ?? '';
+        const lowerAuthorHandle = author?.handle?.toLowerCase() ?? '';
+        for (const wl of monitorState.watchlists) {
+          const match = wl.kind === 'account'
+            ? (lowerAuthorName.includes(wl.value) || lowerAuthorHandle.includes(wl.value))
+            : lowerText.includes(wl.value);
+          if (!match) continue;
+          highlightMatched(postEl);
+          browser.runtime.sendMessage({
+            type: 'WATCHLIST_HIT',
+            row: {
+              ts: Date.now(),
+              watchlistId: wl.id,
+              platform: platformKind,
+              text: text.slice(0, 1000),
+              author: author?.name || author?.handle,
+              postUrl: permalink,
+              read: false,
+            },
+          }).catch(() => { /* ignore */ });
+        }
+      }
+    }
+
+    function shannonEntropy(s: string): number {
+      const freq: Record<string, number> = {};
+      for (const c of s) freq[c] = (freq[c] || 0) + 1;
+      let h = 0;
+      const len = s.length;
+      for (const k in freq) {
+        const p = freq[k] / len;
+        h -= p * Math.log2(p);
+      }
+      return h;
+    }
+
+    function scrapeReplies(postEl: HTMLElement, platformKind: 'x' | 'facebook'): string[] {
+      const out: string[] = [];
+      if (platformKind === 'x') {
+        // On a tweet permalink, replies are sibling articles below the focal one.
+        const articles = Array.from(document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]'));
+        const focalIdx = articles.indexOf(postEl);
+        const start = focalIdx >= 0 ? focalIdx + 1 : 0;
+        for (let i = start; i < articles.length && out.length < 30; i++) {
+          const tx = articles[i].querySelector('[data-testid="tweetText"]')?.textContent?.trim();
+          if (tx && tx.length > 4) out.push(tx);
+        }
+      } else {
+        // Facebook: comments are nested articles inside the post container, or a sibling list.
+        const candidates = postEl.querySelectorAll<HTMLElement>('[role="article"]');
+        for (const c of candidates) {
+          if (c === postEl) continue;
+          const txEl = c.querySelector('div[dir="auto"]');
+          const tx = txEl?.textContent?.trim();
+          if (tx && tx.length > 4 && !out.includes(tx)) out.push(tx);
+          if (out.length >= 30) break;
+        }
+      }
+      return out;
+    }
+
+    async function scrapeAuthorFeatures(postEl: HTMLElement, platformKind: 'x' | 'facebook') {
+      const features: { defaultAvatar?: boolean; handleEntropy?: number; verifiedKind?: 'none' | 'paid' | 'legacy' | 'gov' } = {};
+      if (platformKind === 'x') {
+        const author = extractAuthor(postEl, 'x');
+        if (author?.handle) features.handleEntropy = shannonEntropy(author.handle);
+        const avatar = postEl.querySelector<HTMLImageElement>('[data-testid^="UserAvatar-Container"] img');
+        if (avatar?.src) features.defaultAvatar = avatar.src.includes('default_profile') || avatar.src.includes('sticker_default');
+        // Verification badge — X uses different SVGs for paid vs legacy/gov
+        const userNameEl = postEl.querySelector('[data-testid="User-Name"]');
+        if (userNameEl) {
+          const govIcon = userNameEl.querySelector('[aria-label*="Government" i], [aria-label*="Affiliated" i]');
+          const verifiedIcon = userNameEl.querySelector('svg[aria-label*="Verified" i], [data-testid="icon-verified"]');
+          if (govIcon) features.verifiedKind = 'gov';
+          else if (verifiedIcon) features.verifiedKind = 'paid';
+          else features.verifiedKind = 'none';
+        }
+      } else {
+        const author = extractAuthor(postEl, 'facebook');
+        if (author?.name) features.handleEntropy = shannonEntropy(author.name);
+      }
+      return features;
+    }
+
+    const intelPanel = mountIntelPanel({
+      scrapeReplies,
+      scrapeAuthorFeatures,
+      showFactCheckPopover: (anchor, text) => showFactCheckPopover(anchor, text),
+    });
 
     // Inject button styles once
     if (!document.getElementById('x-reply-gen-styles')) {
@@ -81,15 +245,15 @@ export default defineContentScript({
           bottom: 24px;
           right: 24px;
           z-index: 999999;
-          background: #000;
-          color: #e7e9ea;
+          background: #ffffff;
+          color: #0f1419;
           padding: 12px 20px;
           border-radius: 12px;
-          border: 1px solid #333;
+          border: 1px solid #eff3f4;
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
           font-size: 14px;
           font-weight: 600;
-          box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+          box-shadow: 0 8px 32px rgba(15, 20, 25, 0.18);
           opacity: 0;
           transform: translateY(12px);
           transition: opacity 0.3s ease, transform 0.3s ease;
@@ -124,18 +288,393 @@ export default defineContentScript({
       }, 3000);
     }
 
-    async function generateReply(tweetText: string): Promise<string> {
+    async function generateReply(tweetText: string, parentText?: string, images?: string[]): Promise<string | string[]> {
       const response = await browser.runtime.sendMessage({
         type: 'GENERATE_REPLY',
         tweetText,
+        parentText,
+        images,
       });
 
-      if (response?.success && response.reply) {
-        return response.reply;
+      if (response?.success) {
+        if (Array.isArray(response.replies) && response.replies.length > 1) {
+          return response.replies as string[];
+        }
+        if (response.reply) return response.reply as string;
       }
 
-      const errorMsg = response?.error || 'AI generation failed';
+      const errorMsg = response?.error || t('content.toast.aiGenerationFailed');
       throw new Error(errorMsg);
+    }
+
+    interface FactCheckResult {
+      verdict: 'true' | 'false' | 'misleading' | 'unverifiable' | 'needs-context';
+      confidence: 'low' | 'medium' | 'high';
+      summary: string;
+      reasoning: string;
+      sources?: Array<{ title: string; url: string; kind?: string; lean?: string; notes?: string }>;
+      searchUsed?: boolean;
+    }
+
+    const sourceKindPalette: Record<string, { bg: string; fg: string; border: string }> = {
+      news: { bg: '#dceeff', fg: '#0a4a7a', border: '#1d9bf0' },
+      wiki: { bg: '#eef2f7', fg: '#3a4148', border: '#71767b' },
+      'state-affiliated': { bg: '#fff5d6', fg: '#7a5500', border: '#ffb700' },
+      official: { bg: '#d1f4e0', fg: '#00574a', border: '#00ba7c' },
+      'fact-check': { bg: '#e8e1ff', fg: '#3b1f8a', border: '#7a5af8' },
+      academic: { bg: '#dff4f4', fg: '#1f5e5e', border: '#3aa6a6' },
+      blog: { bg: '#f7e9d6', fg: '#7a4a00', border: '#d49146' },
+      social: { bg: '#fde4e6', fg: '#a01018', border: '#f4212e' },
+      forum: { bg: '#fde4e6', fg: '#a01018', border: '#f4212e' },
+      unknown: { bg: '#eff3f4', fg: '#536471', border: '#cfd9de' },
+    };
+    const sourceLeanLabel: Record<string, string> = { left: 'L', 'center-left': 'CL', center: 'C', 'center-right': 'CR', right: 'R', mixed: 'M' };
+    function renderSourceChip(kind: string, lean?: string, notes?: string): string {
+      const p = sourceKindPalette[kind] || sourceKindPalette.unknown;
+      const kindLabel = kind === 'state-affiliated' ? 'state' : kind;
+      const leanPart = lean ? ` · ${sourceLeanLabel[lean] || lean}` : '';
+      const titleAttr = notes ? ` title="${escapeHtml(notes)}"` : '';
+      return `<span${titleAttr} style="display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;padding:1px 6px;border-radius:999px;background:${p.bg};color:${p.fg};border:1px solid ${p.border};margin-right:6px;flex-shrink:0;">${escapeHtml(kindLabel)}${leanPart}</span>`;
+    }
+
+    function escapeHtml(s: string): string {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    async function showFactCheckPopover(anchorEl: HTMLElement, postText: string) {
+      document.getElementById('x-reply-gen-fact')?.remove();
+
+      const rect = anchorEl.getBoundingClientRect();
+      const top = Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - 460));
+      const left = Math.max(8, Math.min(rect.left - 100, window.innerWidth - 400));
+
+      const popover = document.createElement('div');
+      popover.id = 'x-reply-gen-fact';
+      popover.style.cssText = `
+        position: fixed;
+        top: ${top}px;
+        left: ${left}px;
+        z-index: 999998;
+        background: #ffffff;
+        border: 1px solid #eff3f4;
+        border-radius: 14px;
+        padding: 14px 16px;
+        box-shadow: 0 16px 48px rgba(15, 20, 25, 0.22);
+        width: 380px;
+        max-height: 460px;
+        overflow-y: auto;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans Arabic", sans-serif;
+        color: #0f1419;
+        font-size: 13px;
+        line-height: 1.5;
+      `;
+
+      let resolved = false;
+      function dismiss() {
+        if (resolved) return;
+        resolved = true;
+        popover.remove();
+        document.removeEventListener('mousedown', outsideHandler, true);
+      }
+      function outsideHandler(e: MouseEvent) {
+        if (!popover.contains(e.target as Node) && e.target !== anchorEl) dismiss();
+      }
+
+      const closeBtn = `<button id="x-reply-gen-fact-close" style="position:absolute;top:10px;right:10px;background:transparent;border:none;color:#536471;cursor:pointer;font-size:18px;line-height:1;padding:4px 8px;border-radius:6px;">×</button>`;
+
+      popover.innerHTML = `
+        <div style="position:relative;text-align:center;padding:24px 0;color:#536471;">
+          <div class="x-reply-gen-spinner" style="display:inline-block;width:18px;height:18px;border:2px solid #cfd9de;border-top-color:#1d9bf0;border-radius:50%;animation:x-reply-gen-spin 0.8s linear infinite;margin-bottom:8px;"></div>
+          <div>${escapeHtml(t('factCheck.checking'))}</div>
+        </div>
+      `;
+      document.body.appendChild(popover);
+
+      // Spinner keyframes injected once
+      if (!document.getElementById('x-reply-gen-spinner-styles')) {
+        const s = document.createElement('style');
+        s.id = 'x-reply-gen-spinner-styles';
+        s.textContent = '@keyframes x-reply-gen-spin { to { transform: rotate(360deg); } }';
+        document.head.appendChild(s);
+      }
+
+      setTimeout(() => document.addEventListener('mousedown', outsideHandler, true), 100);
+
+      try {
+        const response = await browser.runtime.sendMessage({ type: 'FACT_CHECK_POST', postText });
+        if (resolved) return;
+
+        if (response?.success && response.result) {
+          renderFactCheckResult(popover, response.result, closeBtn, dismiss);
+        } else {
+          popover.innerHTML = `
+            ${closeBtn}
+            <div style="color:#f4212e;padding:12px 4px;font-weight:600;">
+              ${escapeHtml(response?.error || t('factCheck.failed'))}
+            </div>
+          `;
+          popover.querySelector('#x-reply-gen-fact-close')?.addEventListener('click', dismiss);
+        }
+      } catch (err) {
+        if (resolved) return;
+        const msg = err instanceof Error ? err.message : t('factCheck.failed');
+        popover.innerHTML = `
+          ${closeBtn}
+          <div style="color:#f4212e;padding:12px 4px;font-weight:600;">${escapeHtml(msg)}</div>
+        `;
+        popover.querySelector('#x-reply-gen-fact-close')?.addEventListener('click', dismiss);
+      }
+    }
+
+    function renderFactCheckResult(container: HTMLElement, result: FactCheckResult, closeBtn: string, dismiss: () => void) {
+      const verdictStyles: Record<string, { bg: string; border: string; text: string; labelKey: string }> = {
+        'true': { bg: '#d1f4e0', border: '#00ba7c', text: '#00574a', labelKey: 'factCheck.verdict.true' },
+        'false': { bg: '#fde4e6', border: '#f4212e', text: '#a01018', labelKey: 'factCheck.verdict.false' },
+        'misleading': { bg: '#fff5d6', border: '#ffb700', text: '#7a5500', labelKey: 'factCheck.verdict.misleading' },
+        'unverifiable': { bg: '#e8eef2', border: '#71767b', text: '#3a4148', labelKey: 'factCheck.verdict.unverifiable' },
+        'needs-context': { bg: '#dceeff', border: '#1d9bf0', text: '#0a4a7a', labelKey: 'factCheck.verdict.needsContext' },
+      };
+      const v = verdictStyles[result.verdict] || verdictStyles['unverifiable'];
+      const confidenceLabelMap: Record<string, string> = {
+        low: t('factCheck.confidenceLow'),
+        medium: t('factCheck.confidenceMedium'),
+        high: t('factCheck.confidenceHigh'),
+      };
+
+      const sourcesHtml = result.sources && result.sources.length > 0
+        ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid #eff3f4;">
+             <div style="font-size:10px;font-weight:700;color:#536471;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">
+               ${escapeHtml(t('factCheck.sources'))} (${result.sources.length})
+             </div>
+             <div style="display:flex;flex-direction:column;gap:6px;">
+               ${result.sources.map((s) => `
+                 <div style="display:flex;align-items:center;gap:0;line-height:1.4;">
+                   ${renderSourceChip(s.kind || 'unknown', s.lean, s.notes)}
+                   <a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer"
+                      style="font-size:12px;color:#1d9bf0;text-decoration:none;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                     ${escapeHtml(s.title || s.url)}
+                   </a>
+                 </div>
+               `).join('')}
+             </div>
+           </div>`
+        : '';
+
+      const disclaimerKey = result.searchUsed ? 'factCheck.disclaimerSearch' : 'factCheck.disclaimer';
+
+      container.innerHTML = `
+        ${closeBtn}
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
+          <span style="background:${v.bg};border:1px solid ${v.border};color:${v.text};padding:5px 12px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:0.02em;">
+            ${escapeHtml(t(v.labelKey as any))}
+          </span>
+          <span style="font-size:11px;color:#536471;text-transform:uppercase;letter-spacing:0.5px;font-weight:700;">
+            ${escapeHtml(t('factCheck.confidence'))}: ${escapeHtml(confidenceLabelMap[result.confidence] || result.confidence)}
+          </span>
+          ${result.searchUsed ? `<span style="font-size:10px;color:#00ba7c;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;">🔎 ${escapeHtml(t('factCheck.searchUsed'))}</span>` : ''}
+        </div>
+        <div style="font-weight:600;margin-bottom:10px;color:#0f1419;font-size:14px;line-height:1.45;">
+          ${escapeHtml(result.summary)}
+        </div>
+        <div style="color:#536471;font-size:12.5px;line-height:1.6;margin-bottom:0;">
+          ${escapeHtml(result.reasoning)}
+        </div>
+        ${sourcesHtml}
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid #eff3f4;color:#71767b;font-size:11px;line-height:1.45;">
+          ⚠ ${escapeHtml(t(disclaimerKey as any))}
+        </div>
+      `;
+      container.querySelector('#x-reply-gen-fact-close')?.addEventListener('click', dismiss);
+    }
+
+    function showStreamingPreview(anchorEl: HTMLElement): { update: (text: string) => void; close: () => void } {
+      document.getElementById('x-reply-gen-stream')?.remove();
+
+      const rect = anchorEl.getBoundingClientRect();
+      const top = Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - 200));
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - 380));
+
+      const box = document.createElement('div');
+      box.id = 'x-reply-gen-stream';
+      box.style.cssText = `
+        position: fixed;
+        top: ${top}px;
+        left: ${left}px;
+        z-index: 999998;
+        background: #ffffff;
+        border: 1px solid #1d9bf0;
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: 0 12px 40px rgba(15, 20, 25, 0.18);
+        width: 360px;
+        max-height: 240px;
+        overflow-y: auto;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 13px;
+        line-height: 1.5;
+        color: #0f1419;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      `;
+      box.textContent = '…';
+      document.body.appendChild(box);
+
+      return {
+        update: (text: string) => { box.textContent = text || '…'; box.scrollTop = box.scrollHeight; },
+        close: () => box.remove(),
+      };
+    }
+
+    async function streamReply(tweetText: string, parentText: string | undefined, anchorEl: HTMLElement, images?: string[]): Promise<string> {
+      const preview = showStreamingPreview(anchorEl);
+      return new Promise<string>((resolve, reject) => {
+        const port = browser.runtime.connect({ name: 'generate-stream' });
+        let full = '';
+        let settled = false;
+
+        const finish = (err: Error | null, text: string) => {
+          if (settled) return;
+          settled = true;
+          preview.close();
+          try { port.disconnect(); } catch { /* ignore */ }
+          if (err) reject(err); else resolve(text);
+        };
+
+        port.onMessage.addListener((msg: any) => {
+          if (msg?.type === 'delta' && typeof msg.text === 'string') {
+            full += msg.text;
+            preview.update(full);
+          } else if (msg?.type === 'done') {
+            const finalText = typeof msg.text === 'string' && msg.text ? msg.text : full;
+            finish(null, finalText);
+          } else if (msg?.type === 'error') {
+            finish(new Error(msg.error || 'Streaming error'), '');
+          }
+        });
+
+        port.onDisconnect.addListener(() => {
+          if (!settled) {
+            if (full) finish(null, full);
+            else finish(new Error('Stream disconnected'), '');
+          }
+        });
+
+        port.postMessage({ type: 'GENERATE_REPLY_STREAM', tweetText, parentText, images });
+      });
+    }
+
+    function showVariationsPicker(replies: string[], anchorEl: HTMLElement, onPick: (reply: string | null) => void) {
+      document.getElementById('x-reply-gen-picker')?.remove();
+
+      const rect = anchorEl.getBoundingClientRect();
+      const top = Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - 340));
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - 380));
+
+      const picker = document.createElement('div');
+      picker.id = 'x-reply-gen-picker';
+      picker.style.cssText = `
+        position: fixed;
+        top: ${top}px;
+        left: ${left}px;
+        z-index: 999998;
+        background: #ffffff;
+        border: 1px solid #eff3f4;
+        border-radius: 12px;
+        padding: 8px;
+        box-shadow: 0 12px 40px rgba(15, 20, 25, 0.18);
+        width: 360px;
+        max-height: 320px;
+        overflow-y: auto;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        color: #0f1419;
+      `;
+
+      const title = document.createElement('div');
+      title.textContent = t('content.picker.title');
+      title.style.cssText = 'font-size: 11px; font-weight: 700; color: #536471; text-transform: uppercase; letter-spacing: 0.4px; padding: 6px 10px 8px;';
+      picker.appendChild(title);
+
+      let resolved = false;
+      function outsideHandler(e: MouseEvent) {
+        if (!picker.contains(e.target as Node)) finish(null);
+      }
+      const finish = (reply: string | null) => {
+        if (resolved) return;
+        resolved = true;
+        picker.remove();
+        document.removeEventListener('mousedown', outsideHandler, true);
+        onPick(reply);
+      };
+
+      replies.forEach((reply) => {
+        const item = document.createElement('div');
+        item.textContent = reply;
+        item.style.cssText = `
+          padding: 10px 12px;
+          border-radius: 8px;
+          cursor: pointer;
+          font-size: 13px;
+          line-height: 1.45;
+          margin-bottom: 4px;
+          white-space: pre-wrap;
+          word-wrap: break-word;
+          background: #f7f9fa;
+          border: 1px solid transparent;
+          transition: background 0.15s, border-color 0.15s;
+          color: #0f1419;
+        `;
+        item.addEventListener('mouseenter', () => {
+          item.style.background = 'rgba(29, 155, 240, 0.08)';
+          item.style.borderColor = '#1d9bf0';
+        });
+        item.addEventListener('mouseleave', () => {
+          item.style.background = '#f7f9fa';
+          item.style.borderColor = 'transparent';
+        });
+        item.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          finish(reply);
+        });
+        picker.appendChild(item);
+      });
+
+      setTimeout(() => document.addEventListener('mousedown', outsideHandler, true), 100);
+      document.body.appendChild(picker);
+    }
+
+    function findXParentText(postEl: HTMLElement): string | undefined {
+      if (!location.pathname.includes('/status/')) return undefined;
+      const all = Array.from(document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]'));
+      const idx = all.indexOf(postEl);
+      if (idx <= 0) return undefined;
+      const { text } = extractPostData(all[idx - 1], 'x');
+      return text || undefined;
+    }
+
+    function extractImageUrls(postEl: HTMLElement, platform: 'x' | 'facebook'): string[] {
+      const urls: string[] = [];
+      const seen = new Set<string>();
+      const imgs = postEl.querySelectorAll('img');
+      for (const img of imgs) {
+        const src = img.src;
+        if (!src || src.startsWith('data:')) continue;
+        if (img.width > 0 && img.width < 80) continue;
+        if (img.height > 0 && img.height < 80) continue;
+        let isContent = false;
+        if (platform === 'x') {
+          isContent = src.includes('pbs.twimg.com/media/') || src.includes('twimg.com/media/');
+        } else {
+          isContent = src.includes('fbcdn.net') && !src.includes('emoji');
+        }
+        if (!isContent) continue;
+        if (seen.has(src)) continue;
+        seen.add(src);
+        urls.push(src);
+      }
+      return urls.slice(0, 4);
     }
 
     async function fillComposer(replyText: string, platform: 'x' | 'facebook', postEl?: HTMLElement) {
@@ -155,7 +694,7 @@ export default defineContentScript({
         }
 
         if (!editor) {
-          showToast('Could not find reply box', true);
+          showToast(t('content.toast.couldNotFindReplyBox'), true);
           return false;
         }
 
@@ -165,7 +704,7 @@ export default defineContentScript({
         document.execCommand('selectAll', false);
         await new Promise((r) => setTimeout(r, 50));
         document.execCommand('insertText', false, replyText);
-        showToast('Reply filled — ready to post');
+        showToast(t('content.toast.replyFilled'));
         return true;
       }
 
@@ -260,7 +799,7 @@ export default defineContentScript({
             editor.value = replyText;
             editor.dispatchEvent(new Event('input', { bubbles: true }));
             editor.dispatchEvent(new Event('change', { bubbles: true }));
-            showToast('Reply filled — ready to post');
+            showToast(t('content.toast.replyFilled'));
             return true;
           }
 
@@ -276,7 +815,7 @@ export default defineContentScript({
 
           // Check if text was actually inserted
           if (editable.textContent?.includes(replyText.slice(0, 20))) {
-            showToast('Reply filled — ready to post');
+            showToast(t('content.toast.replyFilled'));
             return true;
           }
 
@@ -295,7 +834,7 @@ export default defineContentScript({
           await new Promise((r) => setTimeout(r, 200));
 
           if (editable.textContent?.includes(replyText.slice(0, 20))) {
-            showToast('Reply filled — ready to post');
+            showToast(t('content.toast.replyFilled'));
             return true;
           }
 
@@ -334,19 +873,19 @@ export default defineContentScript({
           await new Promise((r) => setTimeout(r, 200));
 
           if (editable.textContent?.includes(replyText.slice(0, 20))) {
-            showToast('Reply filled — ready to post');
+            showToast(t('content.toast.replyFilled'));
             return true;
           }
 
           console.log('[X Reply Gen] All insertion methods failed');
-          showToast('Could not fill comment box', true);
+          showToast(t('content.toast.couldNotFillCommentBox'), true);
           return false;
         }
 
         await new Promise((r) => setTimeout(r, 200));
       }
 
-      showToast('Could not find comment box', true);
+      showToast(t('content.toast.couldNotFindCommentBox'), true);
       return false;
     }
 
@@ -430,17 +969,39 @@ export default defineContentScript({
           const { text } = extractPostData(targetEl as HTMLElement, 'facebook');
           console.log('[X Reply Gen] Extracted text for reply:', text.slice(0, 100));
           if (!text) {
-            showToast('Could not read post text', true);
+            showToast(t('content.toast.couldNotReadPost'), true);
             return;
           }
-          const reply = await generateReply(text);
+          const images = extractImageUrls(targetEl as HTMLElement, 'facebook');
+          const flags = await browser.storage.local.get(['variations', 'streaming']);
+          const useStreaming = !!flags.streaming && !flags.variations;
+
+          let reply: string;
+          if (useStreaming) {
+            btn.style.opacity = '1';
+            reply = await streamReply(text, undefined, btn, images);
+            btn.style.opacity = '0.5';
+          } else {
+            const result = await generateReply(text, undefined, images);
+            if (Array.isArray(result)) {
+              btn.style.opacity = '1';
+              const picked = await new Promise<string | null>((resolve) => {
+                showVariationsPicker(result, btn, resolve);
+              });
+              if (!picked) return;
+              reply = picked;
+              btn.style.opacity = '0.5';
+            } else {
+              reply = result;
+            }
+          }
 
           const filled = await fillComposer(reply, 'facebook', composer);
           if (!filled) {
-            showToast('Could not fill comment box', true);
+            showToast(t('content.toast.couldNotFillCommentBox'), true);
           }
         } catch (err) {
-          const message = err instanceof Error ? err.message : 'Failed to generate reply';
+          const message = err instanceof Error ? err.message : t('content.toast.failedToGenerate');
           console.error('[X Reply Gen] Error:', message);
           showToast(message, true);
         } finally {
@@ -454,6 +1015,260 @@ export default defineContentScript({
       console.log('[X Reply Gen] Composer button injected into toolbar');
     }
 
+    function injectFactCheckFloating(article: HTMLElement, platformKind: 'x' | 'facebook') {
+      if (article.querySelector('[data-x-reply-gen="fact-btn"]')) return;
+      const computed = getComputedStyle(article);
+      if (computed.position === 'static') {
+        article.style.position = 'relative';
+      }
+
+      const btn = document.createElement('div');
+      btn.setAttribute('role', 'button');
+      btn.setAttribute('tabindex', '0');
+      btn.setAttribute('aria-label', t('factCheck.btnLabel'));
+      btn.setAttribute('title', t('factCheck.btnLabel'));
+      btn.setAttribute('data-x-reply-gen', 'fact-btn');
+      btn.style.cssText = 'position: absolute; top: 10px; right: 56px; width: 32px; height: 32px; border-radius: 50%; background: #ffffff; color: #1d9bf0; border: 1px solid #cfd9de; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 3px rgba(15,20,25,0.12); z-index: 5; transition: background 0.15s, border-color 0.15s;';
+      btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="20" y1="20" x2="16.5" y2="16.5"/></svg>';
+
+      btn.addEventListener('mouseenter', () => { btn.style.background = '#f7f9fa'; btn.style.borderColor = '#1d9bf0'; });
+      btn.addEventListener('mouseleave', () => { btn.style.background = '#ffffff'; btn.style.borderColor = '#cfd9de'; });
+
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const { text: postText } = extractPostData(article, platformKind);
+        if (!postText) {
+          showToast(t('content.toast.couldNotReadPost'), true);
+          return;
+        }
+        showFactCheckPopover(btn, postText);
+      });
+
+      article.appendChild(btn);
+
+      injectOsintRow(article, platformKind, { floatingTopOffset: 50, anchor: 'absolute' });
+    }
+
+    function buildArchiveAndReverseRow(postEl: HTMLElement, platformKind: 'x' | 'facebook'): HTMLElement | null {
+      const images = extractImageUrls(postEl, platformKind);
+      const permalink = findPostPermalink(postEl, platformKind);
+
+      const row = document.createElement('div');
+      row.setAttribute('data-x-reply-gen', 'osint-row');
+      row.style.cssText = 'display: inline-flex; align-items: center; gap: 4px;';
+
+      row.appendChild(buildIntelButton(postEl, platformKind));
+      if (permalink) row.appendChild(buildArchiveButton(permalink));
+      if (images.length > 0) row.appendChild(buildReverseImageMenu(images));
+
+      return row.children.length > 0 ? row : null;
+    }
+
+    function buildIntelButton(postEl: HTMLElement, platformKind: 'x' | 'facebook'): HTMLDivElement {
+      const btn = buildIconButton(
+        t('osint.intel.label'),
+        '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 12h6"/><path d="M12 9v6"/></svg>',
+        '#7a5af8',
+      );
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const { text } = extractPostData(postEl, platformKind);
+        if (!text) {
+          showToast(t('content.toast.couldNotReadPost'), true);
+          return;
+        }
+        const target: PanelTarget = {
+          platform: platformKind as Platform,
+          postElement: postEl,
+          text,
+          author: extractAuthor(postEl, platformKind)?.name,
+          authorHandle: extractAuthor(postEl, platformKind)?.handle,
+          permalink: findPostPermalink(postEl, platformKind) || undefined,
+          images: extractImageUrls(postEl, platformKind),
+        };
+        intelPanel.open(target, 'claims');
+      });
+      return btn;
+    }
+
+    function extractAuthor(postEl: HTMLElement, platformKind: 'x' | 'facebook'): { name?: string; handle?: string } | undefined {
+      if (platformKind === 'x') {
+        const userNameEl = postEl.querySelector('[data-testid="User-Name"]');
+        if (!userNameEl) return undefined;
+        const spans = userNameEl.querySelectorAll('span');
+        let name: string | undefined;
+        let handle: string | undefined;
+        for (const sp of spans) {
+          const text = sp.textContent?.trim() ?? '';
+          if (!text) continue;
+          if (text.startsWith('@')) handle = text.slice(1);
+          else if (!name && !text.includes('·') && text.length < 60) name = text;
+        }
+        return { name, handle };
+      }
+      const link = postEl.querySelector('h2 a, h3 a, h4 a, strong a');
+      const name = link?.textContent?.trim() || undefined;
+      return { name };
+    }
+
+    function injectOsintRow(article: HTMLElement, platformKind: 'x' | 'facebook', opts: { floatingTopOffset?: number; anchor?: 'absolute' | 'inline' } = {}) {
+      if (article.querySelector('[data-x-reply-gen="osint-row"]')) return;
+      const row = buildArchiveAndReverseRow(article, platformKind);
+      if (!row) return;
+
+      if (opts.anchor === 'absolute') {
+        row.style.cssText += `;position:absolute;top:${opts.floatingTopOffset ?? 50}px;right:10px;background:#ffffff;border:1px solid #cfd9de;border-radius:999px;padding:3px 6px;box-shadow:0 1px 3px rgba(15,20,25,0.12);z-index:5;`;
+        article.appendChild(row);
+      } else {
+        article.appendChild(row);
+      }
+    }
+
+    function findPostPermalink(postEl: HTMLElement, platformKind: 'x' | 'facebook'): string | null {
+      if (platformKind === 'x') {
+        const link = postEl.querySelector<HTMLAnchorElement>('a[href*="/status/"] time')?.parentElement as HTMLAnchorElement | null;
+        if (link?.href) return link.href;
+        const any = postEl.querySelector<HTMLAnchorElement>('a[href*="/status/"]');
+        return any?.href ?? null;
+      }
+      const a = postEl.querySelector<HTMLAnchorElement>('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/photo/"], a[href*="/videos/"], a[href*="story_fbid="]');
+      return a?.href ?? null;
+    }
+
+    function buildIconButton(label: string, svg: string, color = '#1d9bf0'): HTMLDivElement {
+      const b = document.createElement('div');
+      b.setAttribute('role', 'button');
+      b.setAttribute('tabindex', '0');
+      b.setAttribute('aria-label', label);
+      b.setAttribute('title', label);
+      b.style.cssText = `display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;cursor:pointer;background:#ffffff;color:${color};border:1px solid #cfd9de;user-select:none;flex-shrink:0;transition:background 0.15s, border-color 0.15s;`;
+      b.innerHTML = svg;
+      b.addEventListener('mouseenter', () => { b.style.background = '#f7f9fa'; b.style.borderColor = color; });
+      b.addEventListener('mouseleave', () => { b.style.background = '#ffffff'; b.style.borderColor = '#cfd9de'; });
+      return b;
+    }
+
+    function buildArchiveButton(permalink: string): HTMLDivElement {
+      const btn = buildIconButton(
+        t('osint.archive.label'),
+        '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg>',
+      );
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        btn.style.opacity = '0.5';
+        showToast(t('osint.archive.starting'));
+        try {
+          const resp = await browser.runtime.sendMessage({ type: 'ARCHIVE_URL', url: permalink });
+          if (resp?.success && resp.wayback) {
+            try { await navigator.clipboard.writeText(resp.wayback); } catch { /* ignore */ }
+            showToast(t('osint.archive.done'));
+          } else if (resp?.archiveToday) {
+            window.open(resp.archiveToday, '_blank', 'noopener,noreferrer');
+            showToast(t('osint.archive.fallback'));
+          } else {
+            showToast(resp?.error || t('osint.archive.failed'), true);
+          }
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : t('osint.archive.failed'), true);
+        } finally {
+          btn.style.opacity = '1';
+        }
+      });
+      return btn;
+    }
+
+    function buildReverseImageMenu(images: string[]): HTMLDivElement {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'position:relative;display:inline-flex;';
+      const btn = buildIconButton(
+        t('osint.reverseImage.label'),
+        '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M21 17l-5-5-9 9"/></svg>',
+        '#ff7a00',
+      );
+      let menu: HTMLDivElement | null = null;
+      const closeMenu = () => { menu?.remove(); menu = null; document.removeEventListener('mousedown', onOutside, true); };
+      function onOutside(e: MouseEvent) {
+        if (menu && !menu.contains(e.target as Node) && e.target !== btn) closeMenu();
+      }
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (menu) { closeMenu(); return; }
+        const rect = btn.getBoundingClientRect();
+        menu = document.createElement('div');
+        menu.style.cssText = `position:fixed;top:${rect.bottom + 4}px;left:${Math.max(8, rect.left - 60)}px;z-index:999999;background:#ffffff;border:1px solid #cfd9de;border-radius:10px;padding:4px;box-shadow:0 8px 24px rgba(15,20,25,0.18);font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:12px;min-width:180px;`;
+        const engines: Array<{ name: string; build: (u: string) => string }> = [
+          { name: 'Google Lens', build: (u) => `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(u)}` },
+          { name: 'Yandex', build: (u) => `https://yandex.com/images/search?rpt=imageview&url=${encodeURIComponent(u)}` },
+          { name: 'TinEye', build: (u) => `https://www.tineye.com/search?url=${encodeURIComponent(u)}` },
+          { name: 'Bing', build: (u) => `https://www.bing.com/images/search?q=imgurl:${encodeURIComponent(u)}&view=detailv2&iss=sbi` },
+        ];
+        const renderRow = (label: string, urls: string[]) => {
+          const row = document.createElement('div');
+          row.style.cssText = 'padding:6px 10px;color:#0f1419;font-weight:600;border-bottom:1px solid #eff3f4;';
+          row.textContent = label;
+          menu!.appendChild(row);
+          urls.forEach((url, idx) => {
+            engines.forEach((eng) => {
+              const item = document.createElement('a');
+              item.href = eng.build(url);
+              item.target = '_blank';
+              item.rel = 'noopener noreferrer';
+              item.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 10px;color:#0f1419;text-decoration:none;border-radius:6px;cursor:pointer;';
+              item.innerHTML = `<span>${eng.name}${images.length > 1 ? ` <span style="color:#71767b;font-size:11px;">img ${idx + 1}</span>` : ''}</span><span style="color:#71767b;font-size:11px;">↗</span>`;
+              item.addEventListener('mouseenter', () => { item.style.background = '#f7f9fa'; });
+              item.addEventListener('mouseleave', () => { item.style.background = 'transparent'; });
+              item.addEventListener('click', () => closeMenu());
+              menu!.appendChild(item);
+            });
+          });
+        };
+        renderRow(t('osint.reverseImage.menuTitle'), images.slice(0, 4));
+        document.body.appendChild(menu);
+        setTimeout(() => document.addEventListener('mousedown', onOutside, true), 50);
+      });
+      wrap.appendChild(btn);
+      return wrap;
+    }
+
+    function injectFactCheckButton(postEl: HTMLElement, actionBar: Element) {
+      if (postEl.querySelector('[data-x-reply-gen="fact-btn"]')) return;
+
+      const btn = document.createElement('div');
+      btn.setAttribute('role', 'button');
+      btn.setAttribute('tabindex', '0');
+      btn.setAttribute('aria-label', t('factCheck.btnLabel'));
+      btn.setAttribute('title', t('factCheck.btnLabel'));
+      btn.setAttribute('data-x-reply-gen', 'fact-btn');
+      btn.style.cssText = 'display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; background: #ffffff; color: #1d9bf0; border: 1px solid #cfd9de; font-family: system-ui, sans-serif; user-select: none; margin-left: 6px; flex-shrink: 0; box-shadow: 0 1px 2px rgba(15,20,25,0.08); transition: background 0.15s, border-color 0.15s;';
+      btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="20" y1="20" x2="16.5" y2="16.5"/></svg>';
+
+      btn.addEventListener('mouseenter', () => { btn.style.background = '#f7f9fa'; btn.style.borderColor = '#1d9bf0'; });
+      btn.addEventListener('mouseleave', () => { btn.style.background = '#ffffff'; btn.style.borderColor = '#cfd9de'; });
+
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const { text: postText } = extractPostData(postEl, 'x');
+        if (!postText) {
+          showToast(t('content.toast.couldNotReadPost'), true);
+          return;
+        }
+        showFactCheckPopover(btn, postText);
+      });
+
+      actionBar.appendChild(btn);
+
+      const osintRow = buildArchiveAndReverseRow(postEl, 'x');
+      if (osintRow) {
+        osintRow.style.cssText += ';margin-left:6px;';
+        actionBar.appendChild(osintRow);
+      }
+    }
+
     function injectXComposerButton() {
       // Inject a small sparkle button into each visible tweet's action bar
       const posts = document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]');
@@ -461,10 +1276,14 @@ export default defineContentScript({
       posts.forEach((postEl) => {
         const rect = postEl.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return;
-        if (postEl.querySelector('[data-x-reply-gen="x-post-btn"]')) return;
 
         const actionBar = postEl.querySelector('[role="group"]');
         if (!actionBar) return;
+
+        // Inject fact-check button (independent of AI Reply button)
+        injectFactCheckButton(postEl, actionBar);
+
+        if (postEl.querySelector('[data-x-reply-gen="x-post-btn"]')) return;
 
         const btn = document.createElement('div');
         btn.setAttribute('role', 'button');
@@ -482,10 +1301,33 @@ export default defineContentScript({
           try {
             const { text } = extractPostData(postEl, 'x');
             if (!text) {
-              showToast('Could not read post text', true);
+              showToast(t('content.toast.couldNotReadPost'), true);
               return;
             }
-            const reply = await generateReply(text);
+            const parentText = findXParentText(postEl);
+            const images = extractImageUrls(postEl, 'x');
+            const flags = await browser.storage.local.get(['variations', 'streaming']);
+            const useStreaming = !!flags.streaming && !flags.variations;
+
+            let reply: string;
+            if (useStreaming) {
+              btn.style.opacity = '1';
+              reply = await streamReply(text, parentText, btn, images);
+              btn.style.opacity = '0.5';
+            } else {
+              const result = await generateReply(text, parentText, images);
+              if (Array.isArray(result)) {
+                btn.style.opacity = '1';
+                const picked = await new Promise<string | null>((resolve) => {
+                  showVariationsPicker(result, btn, resolve);
+                });
+                if (!picked) return;
+                reply = picked;
+                btn.style.opacity = '0.5';
+              } else {
+                reply = result;
+              }
+            }
 
             // Click the reply button to open the composer
             const replyBtn = postEl.querySelector('[data-testid="reply"]') as HTMLElement | null;
@@ -497,10 +1339,10 @@ export default defineContentScript({
             // Find and fill the composer
             const filled = await fillComposer(reply, 'x', postEl);
             if (!filled) {
-              showToast('Could not fill reply box', true);
+              showToast(t('content.toast.couldNotFillReplyBox'), true);
             }
           } catch (err) {
-            const message = err instanceof Error ? err.message : 'Failed to generate reply';
+            const message = err instanceof Error ? err.message : t('content.toast.failedToGenerate');
             showToast(message, true);
           } finally {
             btn.style.opacity = '1';
@@ -514,8 +1356,9 @@ export default defineContentScript({
     function scanForPosts() {
       if (platform === 'x') {
         injectXComposerButton();
+        document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]').forEach((el) => monitorPost(el, 'x'));
       } else {
-        // Facebook — inject buttons inside visible comment composers only
+        // Facebook — inject AI Reply buttons in visible comment composers
         const composerSelectors = [
           'form[role="presentation"]',
           'div[role="presentation"]',
@@ -534,8 +1377,58 @@ export default defineContentScript({
             injectComposerButton(el);
           }
         });
+
+        // Inject fact-check buttons on top-level FB posts
+        const articles = document.querySelectorAll<HTMLElement>('[role="article"]');
+        articles.forEach((article) => {
+          if (article.parentElement?.closest('[role="article"]')) return; // skip nested (comments)
+          const rect = article.getBoundingClientRect();
+          if (rect.height < 120) return; // skip tiny stubs
+          injectFactCheckFloating(article, 'facebook');
+          monitorPost(article, 'facebook');
+        });
       }
     }
+
+    function triggerForFocusedPost() {
+      let target: HTMLElement | null = null;
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) {
+        if (platform === 'x') {
+          target = active.closest('article[data-testid="tweet"]');
+        } else {
+          target = active.closest('form[role="presentation"], div[role="presentation"]');
+        }
+      }
+      if (!target) {
+        const articles = platform === 'x'
+          ? Array.from(document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]'))
+          : Array.from(document.querySelectorAll<HTMLElement>('form[role="presentation"], div[role="presentation"]'));
+        for (const el of articles) {
+          const rect = el.getBoundingClientRect();
+          if (rect.top >= 0 && rect.top < window.innerHeight - 100 && rect.height > 50) {
+            target = el;
+            break;
+          }
+        }
+      }
+      if (!target) {
+        showToast(t('content.toast.noPostFound'), true);
+        return;
+      }
+      const aiBtn = target.querySelector<HTMLElement>('[data-x-reply-gen]');
+      if (aiBtn) {
+        aiBtn.click();
+      } else {
+        showToast(t('content.toast.btnNotReady'), true);
+      }
+    }
+
+    browser.runtime.onMessage.addListener((msg: any) => {
+      if (msg?.type === 'GENERATE_FOR_FOCUSED') {
+        triggerForFocusedPost();
+      }
+    });
 
     scanForPosts();
 

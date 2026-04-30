@@ -15,6 +15,9 @@
     "postinstall": "wxt prepare"
   },
   "dependencies": {
+    "@ai-sdk/openai-compatible": "^2.0.42",
+    "ai": "^6.0.170",
+    "idb": "^8.0.3",
     "vue": "^3.5.29"
   },
   "devDependencies": {

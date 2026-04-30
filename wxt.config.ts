@@ -5,7 +5,7 @@ export default defineConfig({
   manifest: {
     name: 'X Reply Generator',
     description: 'Detects posts on X and Facebook and generates AI replies',
-    permissions: ['storage', 'activeTab'],
+    permissions: ['storage', 'activeTab', 'contextMenus', 'scripting'],
     host_permissions: [
       'https://x.com/*',
       'https://twitter.com/*',
@@ -15,12 +15,22 @@ export default defineConfig({
       'https://api.openai.com/*',
       'https://api.moonshot.cn/*',
       'https://api.deepseek.com/*',
+      'https://api.x.ai/*',
+      'https://generativelanguage.googleapis.com/*',
+      'https://api.search.brave.com/*',
+      'https://api.tavily.com/*',
+      'https://web.archive.org/*',
+      'https://archive.ph/*',
+      'https://archive.today/*',
+      'http://localhost/*',
+      'http://127.0.0.1/*',
     ],
+    optional_host_permissions: ['https://*/*'],
     commands: {
       'generate-reply': {
         suggested_key: {
-          default: 'Ctrl+Shift+R',
-          mac: 'Command+Shift+R',
+          default: 'Alt+Shift+R',
+          mac: 'Alt+Shift+R',
         },
         description: 'Generate AI reply for the focused post',
       },
