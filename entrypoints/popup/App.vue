@@ -1,6 +1,9 @@
 <script lang="ts" setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { t, locale, isRTL, initLocale } from '../../utils/i18n';
+import { providerLabels } from '../../utils/providers';
+import { loadApiKeys } from '../../utils/crypto';
+import { validateStorage } from '../../utils/schemas';
 
 // Read-only — used to compute the status dot and route Test correctly.
 const apiProvider = ref('kimi');
@@ -35,18 +38,7 @@ const customConfigOk = computed(() =>
 );
 const ready = computed(() => hasApiKey.value && customConfigOk.value);
 
-const providerLabel = computed(() => {
-  const map: Record<string, string> = {
-    kimi: 'Kimi',
-    grok: 'Grok',
-    openai: 'OpenAI',
-    deepseek: 'DeepSeek',
-    google: 'Google AI',
-    ollama: 'Ollama',
-    custom: 'Custom',
-  };
-  return map[apiProvider.value] || apiProvider.value;
-});
+const providerLabel = computed(() => providerLabels[apiProvider.value] || apiProvider.value);
 
 const tones = computed(() => [
   { group: t('tone.group.calm'), items: [
@@ -124,24 +116,36 @@ const lengths = computed(() => [
 
 onMounted(async () => {
   await initLocale();
+
+  const keysResult = await loadApiKeys();
+  if (keysResult.keys) {
+    apiKeys.value = keysResult.keys;
+  }
+  if (keysResult.error) {
+    console.warn('[X Reply Gen] Failed to decrypt API keys:', keysResult.error);
+  }
+
   const stored = await browser.storage.local.get([
-    'apiProvider', 'apiKeys', 'apiKey',
+    'apiProvider',
     'customBaseUrl', 'customModel',
     'tone', 'accent', 'replyLength', 'variations',
     'tokensToday', 'tokensDate',
   ]);
-  if (stored.apiProvider) apiProvider.value = stored.apiProvider as string;
-  if (stored.apiKeys) {
-    apiKeys.value = stored.apiKeys as Record<string, string>;
-  } else if (stored.apiKey) {
-    apiKeys.value = { [apiProvider.value]: stored.apiKey as string };
+
+  const validated = validateStorage(stored);
+  if (!validated.success) {
+    console.warn('[X Reply Gen] Storage validation failed, using defaults');
   }
-  if (stored.customBaseUrl) customBaseUrl.value = stored.customBaseUrl as string;
-  if (stored.customModel) customModel.value = stored.customModel as string;
-  if (stored.tone) tone.value = stored.tone as string;
-  if (stored.accent) accent.value = stored.accent as string;
-  if (stored.replyLength) replyLength.value = stored.replyLength as string;
-  if (stored.variations !== undefined) variations.value = stored.variations as boolean;
+  const data = validated.data;
+
+  apiProvider.value = data.apiProvider;
+  if (data.customBaseUrl) customBaseUrl.value = data.customBaseUrl;
+  if (data.customModel) customModel.value = data.customModel;
+  tone.value = data.tone;
+  accent.value = data.accent;
+  replyLength.value = data.replyLength;
+  variations.value = data.variations;
+
   const today = new Date().toISOString().slice(0, 10);
   if (stored.tokensDate === today && typeof stored.tokensToday === 'number') {
     tokensToday.value = stored.tokensToday;

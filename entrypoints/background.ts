@@ -4,10 +4,14 @@ import { z } from 'zod';
 import { loadSearchSettings, webSearch, type SearchResult } from '../utils/search';
 import { t, initLocale } from '../utils/i18n';
 import { labelSource } from '../utils/source-reputation';
+import { BUILTIN_PROVIDERS } from '../utils/providers';
+import { loadApiKeys } from '../utils/crypto';
+import { sha256Hex } from '../utils/text';
 import {
   addCapture, listCaptures, deleteCapture, wipeCaptures,
   addNarrativeHit, listNarrativeHits,
   addWatchlist, listWatchlists, deleteWatchlist, addWatchlistHit, markWatchlistRead, totalUnreadHits,
+  addReplyHistory,
   type CaptureRow,
 } from '../utils/db';
 
@@ -47,38 +51,36 @@ async function trackUsage(tokens: number) {
   });
 }
 
-const PROVIDERS: Record<string, ProviderConfig> = {
-  kimi: {
-    name: 'Kimi',
-    baseUrl: 'https://api.moonshot.cn/v1',
-    model: 'moonshot-v1-8k',
-    supportsVision: false,
-  },
-  grok: {
-    name: 'Grok',
-    baseUrl: 'https://api.x.ai/v1',
-    model: 'grok-3',
-    supportsVision: false,
-  },
-  openai: {
-    name: 'OpenAI',
-    baseUrl: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    supportsVision: true,
-  },
-  deepseek: {
-    name: 'DeepSeek',
-    baseUrl: 'https://api.deepseek.com/v1',
-    model: 'deepseek-chat',
-    supportsVision: false,
-  },
-  google: {
-    name: 'Google AI',
-    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    model: 'gemini-2.5-flash',
-    supportsVision: true,
-  },
-};
+// ── Retry wrapper ───────────────────────────────────────────────────────────
+
+const lastProviderError = new Map<string, number>();
+
+function isRetryableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return msg.includes('429') || msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('504') || msg.includes('fetch') || msg.includes('network') || msg.includes('timeout') || msg.includes('econnrefused');
+}
+
+async function withRetry<T>(fn: () => Promise<T>, opts?: { maxRetries?: number; baseDelay?: number; providerKey?: string }): Promise<T> {
+  const maxRetries = opts?.maxRetries ?? 2;
+  const baseDelay = opts?.baseDelay ?? 1000;
+  const providerKey = opts?.providerKey;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await fn();
+      if (providerKey) lastProviderError.delete(providerKey);
+      return result;
+    } catch (err) {
+      if (attempt === maxRetries || !isRetryableError(err)) throw err;
+      const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 500;
+      console.warn(`[X Reply Gen] Retryable error (attempt ${attempt + 1}/${maxRetries + 1}), waiting ${Math.round(delay)}ms…`);
+      if (providerKey) lastProviderError.set(providerKey, Date.now());
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw new Error('Retry exhausted');
+}
 
 export default defineBackground(() => {
   console.log('[X Reply Gen] Background service worker started');
@@ -390,6 +392,9 @@ export default defineBackground(() => {
     if (message.type === 'CAPTURE_WIPE') {
       return wipeCaptures().then(() => ({ success: true }));
     }
+    if (message.type === 'CAPTURE_SCREENSHOT') {
+      return handleCaptureScreenshot(message.id as number);
+    }
     if (message.type === 'WATCHLIST_LIST') {
       return listWatchlists().then((rows) => ({ success: true, rows }));
     }
@@ -423,7 +428,6 @@ export default defineBackground(() => {
     }
     if (message.type === 'WATCHLIST_HITS') {
       return browser.storage.local.get(['watchlistsCache']).then(() => {
-        // Hits live in IDB only; the cache is for matching, not for display.
         return import('../utils/db').then(async ({ getDb }) => {
           const db = await getDb();
           const tx = db.transaction('watchlistHits', 'readonly');
@@ -457,7 +461,6 @@ export default defineBackground(() => {
     }
   }
 
-  // Make sure the cache is hydrated whenever the service worker spins up.
   syncWatchlistsCache();
 
   async function refreshUnreadBadge(): Promise<void> {
@@ -473,22 +476,33 @@ export default defineBackground(() => {
     let waybackUrl: string | undefined;
     let archiveTodayUrl: string | undefined;
     try {
-      const resp = await fetch(`https://web.archive.org/save/${encodeURI(url)}`, { method: 'GET', redirect: 'follow' });
-      // Wayback returns either a redirect to the snapshot or a "job in progress" page.
+      const resp = await fetch(`https://web.archive.org/save/${encodeURIComponent(url)}`, { method: 'GET', redirect: 'follow' });
       const finalUrl = resp.url || '';
       if (finalUrl.includes('web.archive.org/web/')) {
         waybackUrl = finalUrl;
       } else {
-        // Fall back to the canonical "latest snapshot" URL.
         waybackUrl = `https://web.archive.org/web/${url}`;
       }
     } catch (err) {
       console.warn('[X Reply Gen] Wayback save failed:', err);
     }
-    // archive.today is best-effort: many flows hit a CAPTCHA. We surface the submit URL
-    // so the caller can open it in a tab if needed.
     archiveTodayUrl = `https://archive.ph/?run=1&url=${encodeURIComponent(url)}`;
     return { success: !!(waybackUrl || archiveTodayUrl), wayback: waybackUrl, archiveToday: archiveTodayUrl };
+  }
+
+  async function handleCaptureScreenshot(id: number): Promise<{ success: boolean; error?: string }> {
+    try {
+      const dataUrl = await browser.tabs.captureVisibleTab({ format: 'png' });
+      const db = await import('../utils/db').then(({ getDb }) => getDb());
+      const row = await db.get('captures', id);
+      if (!row) return { success: false, error: 'Capture not found' };
+      row.screenshotData = dataUrl;
+      await db.put('captures', row);
+      return { success: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Screenshot failed';
+      return { success: false, error: msg };
+    }
   }
 
   async function handleExtractClaims(postText: string): Promise<{ success: boolean; claims?: Array<{ text: string; type: 'factual' | 'opinion'; confidence: 'low' | 'medium' | 'high' }>; error?: string }> {
@@ -502,13 +516,13 @@ Output ONLY a JSON object — no other text, no markdown fences:
 
 Reply in the same language as the post.`;
     try {
-      const { text, usage } = await generateText({
+      const { text, usage } = await withRetry(() => generateText({
         model,
         system,
         prompt: `Post:\n\n<post>\n${postText}\n</post>`,
         maxOutputTokens: 800,
         temperature: 0.2,
-      });
+      }), { providerKey: provider.config.name });
       await trackUsage(usage.totalTokens ?? 0);
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return { success: false, error: 'Could not parse claims response' };
@@ -536,13 +550,13 @@ Reply in the same language as the post.`;
 - "hostile" means abusive / personal attack / threat — distinct from "negative" disagreement.
 - Topics: 3 to 5 buckets, ordered by count desc.`;
     try {
-      const { text, usage } = await generateText({
+      const { text, usage } = await withRetry(() => generateText({
         model,
         system,
         prompt: `Replies (${replies.length}):\n${sample}`,
         maxOutputTokens: 600,
         temperature: 0.2,
-      });
+      }), { providerKey: provider.config.name });
       await trackUsage(usage.totalTokens ?? 0);
       const match = text.match(/\{[\s\S]*\}/);
       if (!match) return { success: false, error: 'Could not parse analysis' };
@@ -574,16 +588,21 @@ Reply in the same language as the post.`;
       'customBaseUrl', 'customModel', 'customSupportsVision',
     ]);
     const providerKey = (settings.apiProvider as string) || 'kimi';
-    const apiKeys = settings.apiKeys as Record<string, string> | undefined;
-    const legacyApiKey = settings.apiKey as string | undefined;
-    let apiKey = apiKeys?.[providerKey]?.trim() || legacyApiKey?.trim();
+
+    // Load encrypted API keys (with auto-migration from plaintext)
+    const keysResult = await loadApiKeys();
+    let apiKey: string | undefined = keysResult.keys[providerKey]?.trim();
+    if (!apiKey) {
+      const legacyApiKey = settings.apiKey as string | undefined;
+      apiKey = legacyApiKey?.trim();
+    }
+
     const tone = (settings.tone as string) || 'diplomatic';
     const accent = (settings.accent as string) || 'neutral';
     const customPrompt = settings.customPrompt as string | undefined;
     const useCustomPrompt = settings.useCustomPrompt as boolean || false;
     const replyLength = (settings.replyLength as string) || 'medium';
 
-    // Ollama runs locally — no real key needed; SDK requires a non-empty string.
     if (providerKey === 'ollama' && !apiKey) {
       apiKey = 'ollama';
     }
@@ -612,7 +631,7 @@ Reply in the same language as the post.`;
       const baseUrl = rawBaseUrl.replace(/\/+$/, '');
       config = { name: 'Ollama', baseUrl, model, supportsVision };
     } else {
-      const builtIn = PROVIDERS[providerKey];
+      const builtIn = BUILTIN_PROVIDERS[providerKey];
       if (!builtIn) {
         return { error: `Unknown provider: ${providerKey}` };
       }
@@ -630,11 +649,11 @@ Reply in the same language as the post.`;
 
     try {
       const model = buildModel(provider.config, provider.apiKey);
-      await generateText({
+      await withRetry(() => generateText({
         model,
         prompt: 'ping',
         maxOutputTokens: 1,
-      });
+      }), { providerKey: provider.config.name, maxRetries: 1 });
       return { success: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Network error';
@@ -651,10 +670,15 @@ Reply in the same language as the post.`;
 
   function buildUserContent(text: string, images: string[] | undefined, supportsVision: boolean): any {
     if (!supportsVision || !images || images.length === 0) return text;
-    return [
-      { type: 'text', text },
-      ...images.slice(0, 4).map((url) => ({ type: 'image', image: new URL(url) })),
-    ];
+    const imageParts: Array<{ type: string; image: URL }> = [];
+    for (const url of images.slice(0, 4)) {
+      try {
+        imageParts.push({ type: 'image', image: new URL(url) });
+      } catch {
+        // Skip malformed image URLs
+      }
+    }
+    return [{ type: 'text', text }, ...imageParts];
   }
 
   function resolveSystemPrompt(provider: { useCustomPrompt: boolean; customPrompt: string | null; tone: string; accent: string; replyLength: string }): string {
@@ -687,31 +711,53 @@ Reply in the same language as the post.`;
       console.log(`[X Reply Gen] Calling ${provider.config.name} (tone: ${provider.tone}, accent: ${provider.accent}, length: ${provider.replyLength}${variations ? ', variations: 3' : ''}${imageCount ? `, images: ${imageCount}` : ''})`);
 
       if (variations) {
-        const runs = await Promise.all([0, 1, 2].map(() => generateText({
+        const runs = await Promise.all([0, 1, 2].map(() => withRetry(() => generateText({
           model,
           system: systemPrompt,
           messages: [{ role: 'user', content: userContent }],
           maxOutputTokens,
           temperature: 0.9,
-        })));
+        }), { providerKey: provider.config.name })));
         const replies = runs.map((r) => r.text.trim()).filter(Boolean);
         if (replies.length === 0) return { success: false, error: 'Empty response from AI' };
         const totalTokens = runs.reduce((sum, r) => sum + (r.usage.totalTokens ?? 0), 0);
         await trackUsage(totalTokens);
+        // Save to reply history
+        if (replies[0]) {
+          await addReplyHistory({
+            ts: Date.now(),
+            platform: 'x',
+            postTextHash: await sha256Hex(tweetText),
+            reply: replies[0],
+            tone: provider.tone,
+            accent: provider.accent,
+            provider: provider.config.name,
+          }).catch(() => { /* ignore */ });
+        }
         if (replies.length > 1) return { success: true, replies };
         return { success: true, reply: replies[0] };
       }
 
-      const { text, usage } = await generateText({
+      const { text, usage } = await withRetry(() => generateText({
         model,
         system: systemPrompt,
         messages: [{ role: 'user', content: userContent }],
         maxOutputTokens,
         temperature: 0.8,
-      });
+      }), { providerKey: provider.config.name });
       const reply = text.trim();
       if (!reply) return { success: false, error: 'Empty response from AI' };
       await trackUsage(usage.totalTokens ?? 0);
+      // Save to reply history
+      await addReplyHistory({
+        ts: Date.now(),
+        platform: 'x',
+        postTextHash: await sha256Hex(tweetText),
+        reply,
+        tone: provider.tone,
+        accent: provider.accent,
+        provider: provider.config.name,
+      }).catch(() => { /* ignore */ });
       return { success: true, reply };
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Network error';
@@ -749,13 +795,24 @@ Reply in the same language as the post.`;
         try {
           port.postMessage({ type: 'delta', text: delta });
         } catch {
-          // port may have disconnected mid-stream; stop
           return;
         }
       }
 
       const usage = await result.usage;
       await trackUsage(usage.totalTokens ?? 0);
+      // Save to reply history
+      if (full.trim()) {
+        await addReplyHistory({
+          ts: Date.now(),
+          platform: 'x',
+          postTextHash: await sha256Hex(tweetText),
+          reply: full.trim(),
+          tone: provider.tone,
+          accent: provider.accent,
+          provider: provider.config.name,
+        }).catch(() => { /* ignore */ });
+      }
       try {
         port.postMessage({ type: 'done', text: full });
         port.disconnect();
@@ -836,7 +893,7 @@ Reply in the same language as the post.`;
     const systemPrompt = baseSystem + searchSystem + outputInstruction;
 
     try {
-      const result = await generateText({
+      const result = await withRetry(() => generateText({
         model,
         system: systemPrompt,
         prompt: `Fact-check this post:\n\n<post>\n${postText}\n</post>`,
@@ -844,7 +901,7 @@ Reply in the same language as the post.`;
         ...(searchAvailable ? { stopWhen: stepCountIs(5) } : {}),
         maxOutputTokens: 1200,
         temperature: 0.3,
-      });
+      }), { providerKey: provider.config.name });
 
       const usage = result.totalUsage ?? result.usage;
       await trackUsage(usage?.totalTokens ?? 0);

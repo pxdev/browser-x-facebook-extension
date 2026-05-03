@@ -1,4 +1,5 @@
 import { defineConfig } from 'wxt';
+import { getProviderHostPermissions } from './utils/providers';
 
 export default defineConfig({
   modules: ['@wxt-dev/module-vue'],
@@ -12,11 +13,7 @@ export default defineConfig({
       'https://www.facebook.com/*',
       'https://facebook.com/*',
       'https://m.facebook.com/*',
-      'https://api.openai.com/*',
-      'https://api.moonshot.cn/*',
-      'https://api.deepseek.com/*',
-      'https://api.x.ai/*',
-      'https://generativelanguage.googleapis.com/*',
+      ...getProviderHostPermissions(),
       'https://api.search.brave.com/*',
       'https://api.tavily.com/*',
       'https://web.archive.org/*',
@@ -25,7 +22,6 @@ export default defineConfig({
       'http://localhost/*',
       'http://127.0.0.1/*',
     ],
-    optional_host_permissions: ['https://*/*'],
     commands: {
       'generate-reply': {
         suggested_key: {

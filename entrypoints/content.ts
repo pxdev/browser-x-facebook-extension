@@ -1,5 +1,6 @@
 import { t, initLocale } from '../utils/i18n';
 import { mountIntelPanel, type PanelTarget } from '../utils/intel-panel';
+import { escapeHtml } from '../utils/text';
 import type { Platform } from '../utils/db';
 
 export default defineContentScript({
@@ -49,6 +50,27 @@ export default defineContentScript({
     });
 
     const monitorSeen = new WeakSet<HTMLElement>();
+    const ioObserved = new WeakSet<HTMLElement>();
+    const ioVisible = new WeakSet<HTMLElement>();
+    let fbComposerScanTimer: number | null = null;
+
+    const postIo = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const el = entry.target as HTMLElement;
+        if (ioVisible.has(el)) {
+          postIo.unobserve(el);
+          continue;
+        }
+        ioVisible.add(el);
+        postIo.unobserve(el);
+        if (platform === 'x') {
+          processXPost(el);
+        } else {
+          processFBPost(el);
+        }
+      }
+    }, { rootMargin: '200px' });
 
     function detectPlatform(): 'x' | 'facebook' {
       if (location.hostname.includes('x.com') || location.hostname.includes('twitter.com')) return 'x';
@@ -337,13 +359,7 @@ export default defineContentScript({
       return `<span${titleAttr} style="display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;padding:1px 6px;border-radius:999px;background:${p.bg};color:${p.fg};border:1px solid ${p.border};margin-right:6px;flex-shrink:0;">${escapeHtml(kindLabel)}${leanPart}</span>`;
     }
 
-    function escapeHtml(s: string): string {
-      const div = document.createElement('div');
-      div.textContent = s;
-      return div.innerHTML;
-    }
-
-    async function showFactCheckPopover(anchorEl: HTMLElement, postText: string) {
+    async function showFactCheckPopover(anchorEl: HTMLElement, postText: string, postEl?: HTMLElement) {
       document.getElementById('x-reply-gen-fact')?.remove();
 
       const rect = anchorEl.getBoundingClientRect();
@@ -408,6 +424,10 @@ export default defineContentScript({
 
         if (response?.success && response.result) {
           renderFactCheckResult(popover, response.result, closeBtn, dismiss);
+          if (postEl) {
+            setFactCheckCache(getFactCheckKey(postText), response.result);
+            renderFactCheckBadge(postEl, response.result);
+          }
         } else {
           popover.innerHTML = `
             ${closeBtn}
@@ -487,6 +507,71 @@ export default defineContentScript({
         </div>
       `;
       container.querySelector('#x-reply-gen-fact-close')?.addEventListener('click', dismiss);
+    }
+
+    const factCheckCache = new Map<string, FactCheckResult>();
+    const MAX_CACHE_SIZE = 100;
+
+    function setFactCheckCache(key: string, result: FactCheckResult) {
+      if (factCheckCache.size >= MAX_CACHE_SIZE) {
+        const firstKey = factCheckCache.keys().next().value;
+        if (firstKey !== undefined) factCheckCache.delete(firstKey);
+      }
+      factCheckCache.set(key, result);
+    }
+
+    function getFactCheckKey(text: string): string {
+      return text.slice(0, 300);
+    }
+
+    function renderFactCheckBadge(postEl: HTMLElement, result: FactCheckResult) {
+      postEl.querySelectorAll('[data-x-reply-gen="fc-badge"]').forEach((el) => el.remove());
+
+      const badge = document.createElement('span');
+      badge.setAttribute('data-x-reply-gen', 'fc-badge');
+      badge.setAttribute('title', `${result.summary} (${result.confidence} confidence)`);
+
+      const colors: Record<string, { bg: string; text: string; border: string }> = {
+        'true': { bg: '#d1f4e0', text: '#00574a', border: '#00ba7c' },
+        'false': { bg: '#fde4e6', text: '#a01018', border: '#f4212e' },
+        'misleading': { bg: '#fff5d6', text: '#7a5500', border: '#ffb700' },
+        'unverifiable': { bg: '#e8eef2', text: '#3a4148', border: '#71767b' },
+        'needs-context': { bg: '#dceeff', text: '#0a4a7a', border: '#1d9bf0' },
+      };
+      const c = colors[result.verdict] || colors['unverifiable'];
+
+      const labelMap: Record<string, string> = {
+        'true': 'True',
+        'false': 'False',
+        'misleading': 'Misleading',
+        'unverifiable': 'Unverifiable',
+        'needs-context': 'Needs Context',
+      };
+
+      badge.style.cssText = `display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:${c.bg};color:${c.text};border:1px solid ${c.border};font-size:11px;font-weight:700;cursor:default;letter-spacing:0.02em;`;
+      badge.textContent = labelMap[result.verdict] || result.verdict;
+
+      const fcBtn = postEl.querySelector('[data-x-reply-gen="fact-btn"]') as HTMLElement | null;
+      if (fcBtn) {
+        const computed = getComputedStyle(fcBtn);
+        if (computed.position === 'absolute') {
+          badge.style.position = 'absolute';
+          badge.style.top = '10px';
+          badge.style.right = '92px';
+          badge.style.zIndex = '6';
+          postEl.appendChild(badge);
+        } else {
+          fcBtn.parentElement?.insertBefore(badge, fcBtn.nextSibling);
+        }
+        return;
+      }
+
+      postEl.appendChild(badge);
+    }
+
+    function renderFactCheckBadgeIfCached(postEl: HTMLElement, text: string) {
+      const cached = factCheckCache.get(getFactCheckKey(text));
+      if (cached) renderFactCheckBadge(postEl, cached);
     }
 
     function showStreamingPreview(anchorEl: HTMLElement): { update: (text: string) => void; close: () => void } {
@@ -677,7 +762,151 @@ export default defineContentScript({
       return urls.slice(0, 4);
     }
 
-    async function fillComposer(replyText: string, platform: 'x' | 'facebook', postEl?: HTMLElement) {
+    interface RegenContext {
+      text: string;
+      parentText?: string;
+      images: string[];
+      platform: 'x' | 'facebook';
+      postEl?: HTMLElement;
+      useStreaming: boolean;
+      useVariations: boolean;
+    }
+
+    const composerRegenContext = new WeakMap<HTMLElement, RegenContext>();
+
+    function showRegenerateButton(composer: HTMLElement, context: RegenContext) {
+      composerRegenContext.set(composer, context);
+      if (context.platform === 'facebook') {
+        showRegenerateToolbarButton(composer, context);
+        return;
+      }
+      const container = composer.closest('form, div[role="presentation"], [data-testid="tweetTextarea_0"]') || composer.parentElement;
+      if (!container) return;
+      container.querySelector('[data-x-reply-gen="regen-btn"]')?.remove();
+      const btn = document.createElement('button');
+      btn.setAttribute('data-x-reply-gen', 'regen-btn');
+      btn.setAttribute('aria-label', 'Regenerate reply');
+      btn.textContent = '↻ Regenerate';
+      btn.style.cssText = 'position:absolute;bottom:4px;right:4px;z-index:10;padding:4px 10px;border-radius:999px;border:1px solid #1d9bf0;background:#fff;color:#1d9bf0;font-size:12px;font-weight:600;cursor:pointer;';
+      (container as HTMLElement).style.position = 'relative';
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        btn.style.opacity = '0.5';
+        try {
+          let reply: string;
+          if (context.useStreaming) {
+            reply = await streamReply(context.text, context.parentText, btn, context.images);
+          } else {
+            const result = await generateReply(context.text, context.parentText, context.images);
+            if (Array.isArray(result)) {
+              const picked = await new Promise<string | null>((resolve) => {
+                showVariationsPicker(result, btn, resolve);
+              });
+              if (!picked) { btn.style.opacity = '1'; return; }
+              reply = picked;
+            } else {
+              reply = result;
+            }
+          }
+          await fillComposer(reply, context.platform, context.postEl, context);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : 'Regeneration failed', true);
+        } finally {
+          btn.style.opacity = '1';
+        }
+      });
+      container.appendChild(btn);
+      setTimeout(() => btn.remove(), 10000);
+      const onBlur = () => {
+        setTimeout(() => {
+          if (document.activeElement !== composer && !composer.contains(document.activeElement)) {
+            btn.remove();
+            composer.removeEventListener('blur', onBlur);
+          }
+        }, 100);
+      };
+      composer.addEventListener('blur', onBlur);
+    }
+
+    function showRegenerateToolbarButton(editor: HTMLElement, context: RegenContext) {
+      let toolbarList = editor.closest('form')?.querySelector('ul[data-id="unfocused-state-actions-list"]')
+        || editor.closest('div[role="presentation"]')?.querySelector('ul[data-id="unfocused-state-actions-list"]')
+        || editor.closest('form')?.querySelector('ul[data-id="focused-state-actions-list"]')
+        || editor.closest('div[role="presentation"]')?.querySelector('ul[data-id="focused-state-actions-list"]')
+        || editor.parentElement?.querySelector('ul[data-id="unfocused-state-actions-list"]')
+        || editor.parentElement?.parentElement?.querySelector('ul[data-id="unfocused-state-actions-list"]');
+
+      if (!toolbarList) return;
+
+      // Remove existing to reset timer, then add fresh
+      toolbarList.querySelector('[data-x-reply-gen="regen-btn"]')?.remove();
+
+      const li = document.createElement('li');
+      li.setAttribute('data-x-reply-gen', 'regen-btn');
+      li.style.cssText = 'display: inline-flex; align-items: center; margin-left: 4px;';
+
+      const btn = document.createElement('div');
+      btn.setAttribute('role', 'button');
+      btn.setAttribute('tabindex', '0');
+      btn.setAttribute('aria-label', 'Regenerate reply');
+      btn.style.cssText = 'display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; background: #ffffff; color: #1877f2; border: 1px solid #1877f2; font-family: system-ui, sans-serif; user-select: none; box-shadow: 0 1px 3px rgba(0,0,0,0.15); transition: background 0.15s, border-color 0.15s;';
+      btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3"/></svg>';
+
+      btn.addEventListener('mouseenter', () => { btn.style.background = '#f0f7ff'; btn.style.borderColor = '#1877f2'; });
+      btn.addEventListener('mouseleave', () => { btn.style.background = '#ffffff'; btn.style.borderColor = '#1877f2'; });
+
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        btn.style.opacity = '0.5';
+        try {
+          let reply: string;
+          if (context.useStreaming) {
+            reply = await streamReply(context.text, context.parentText, btn, context.images);
+          } else {
+            const result = await generateReply(context.text, context.parentText, context.images);
+            if (Array.isArray(result)) {
+              const picked = await new Promise<string | null>((resolve) => {
+                showVariationsPicker(result, btn, resolve);
+              });
+              if (!picked) { btn.style.opacity = '1'; return; }
+              reply = picked;
+            } else {
+              reply = result;
+            }
+          }
+          await fillComposer(reply, context.platform, context.postEl, context);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : 'Regeneration failed', true);
+        } finally {
+          btn.style.opacity = '1';
+        }
+      });
+
+      li.appendChild(btn);
+
+      const aiBtn = toolbarList.querySelector('[data-x-reply-gen="composer-btn"]');
+      if (aiBtn && aiBtn.parentElement) {
+        aiBtn.parentElement.after(li);
+      } else {
+        toolbarList.appendChild(li);
+      }
+
+      const removeTimer = window.setTimeout(() => li.remove(), 15000);
+      const onBlur = () => {
+        setTimeout(() => {
+          if (document.activeElement !== editor && !editor.contains(document.activeElement)) {
+            li.remove();
+            window.clearTimeout(removeTimer);
+            editor.removeEventListener('blur', onBlur);
+          }
+        }, 100);
+      };
+      editor.addEventListener('blur', onBlur);
+    }
+
+    async function fillComposer(replyText: string, platform: 'x' | 'facebook', postEl?: HTMLElement, context?: RegenContext) {
       if (platform === 'x') {
         const selectors = [
           '[data-testid="tweetTextarea_0"] [contenteditable="true"]',
@@ -699,13 +928,67 @@ export default defineContentScript({
         }
 
         const editable = editor as HTMLElement;
+
+        // Method 1: paste simulation (works best on modern React editors)
         editable.focus();
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 80));
+        const dataTransfer = new DataTransfer();
+        dataTransfer.setData('text/plain', replyText);
+        dataTransfer.setData('text/html', replyText);
+        const pasteEvent = new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dataTransfer,
+        });
+        editable.dispatchEvent(pasteEvent);
+        await new Promise((r) => setTimeout(r, 150));
+
+        if (editable.textContent?.includes(replyText.slice(0, 20))) {
+          showToast(t('content.toast.replyFilled'));
+          if (context) showRegenerateButton(editable, context);
+          return true;
+        }
+
+        // Method 2: execCommand fallback
+        console.log('[X Reply Gen] Paste failed, trying execCommand...');
         document.execCommand('selectAll', false);
         await new Promise((r) => setTimeout(r, 50));
         document.execCommand('insertText', false, replyText);
-        showToast(t('content.toast.replyFilled'));
-        return true;
+        await new Promise((r) => setTimeout(r, 100));
+
+        if (editable.textContent?.includes(replyText.slice(0, 20))) {
+          showToast(t('content.toast.replyFilled'));
+          if (context) showRegenerateButton(editable, context);
+          return true;
+        }
+
+        // Method 3: direct DOM manipulation
+        console.log('[X Reply Gen] execCommand failed, trying direct DOM...');
+        editable.focus();
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editable);
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+        range.deleteContents();
+        const p = editable.querySelector('p');
+        if (p) {
+          p.innerHTML = '';
+          p.appendChild(document.createTextNode(replyText));
+        } else {
+          editable.appendChild(document.createTextNode(replyText));
+        }
+        editable.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: false, inputType: 'insertText', data: replyText }));
+        await new Promise((r) => setTimeout(r, 150));
+
+        if (editable.textContent?.includes(replyText.slice(0, 20))) {
+          showToast(t('content.toast.replyFilled'));
+          if (context) showRegenerateButton(editable, context);
+          return true;
+        }
+
+        showToast(t('content.toast.couldNotFillReplyBox'), true);
+        return false;
       }
 
       // Facebook - poll for composer up to 5 seconds
@@ -725,23 +1008,24 @@ export default defineContentScript({
         'div[aria-label*="reply" i]',
       ];
 
-      // Helper to query through shadow DOMs
-      function queryDeep(root: Document | Element | ShadowRoot, selector: string): Element[] {
+      // Helper to query through shadow DOMs (depth-limited to avoid expensive traversals)
+      function queryDeep(root: Document | Element | ShadowRoot, selector: string, maxDepth = 2): Element[] {
         const results: Element[] = [];
         try {
           results.push(...Array.from(root.querySelectorAll(selector)));
         } catch { /* ignore */ }
+        if (maxDepth <= 0) return results;
         // Search inside shadow roots
         const allElements = root.querySelectorAll('*');
         for (const el of allElements) {
           if (el.shadowRoot) {
-            results.push(...queryDeep(el.shadowRoot, selector));
+            results.push(...queryDeep(el.shadowRoot, selector, maxDepth - 1));
           }
         }
         return results;
       }
 
-      for (let attempt = 0; attempt < 25; attempt++) {
+      for (let attempt = 0; attempt < 20; attempt++) {
         let candidates: Element[] = [];
 
         // Gather from all scopes + shadow DOMs
@@ -800,28 +1084,15 @@ export default defineContentScript({
             editor.dispatchEvent(new Event('input', { bubbles: true }));
             editor.dispatchEvent(new Event('change', { bubbles: true }));
             showToast(t('content.toast.replyFilled'));
+            if (context) showRegenerateButton(editor as HTMLElement, context);
             return true;
           }
 
           const editable = editor as HTMLElement;
 
-          // Method 1: execCommand (works on simple contenteditables)
+          // Method 1: paste simulation (works on Lexical and React editors)
           editable.focus();
           await new Promise((r) => setTimeout(r, 100));
-          document.execCommand('selectAll', false);
-          await new Promise((r) => setTimeout(r, 50));
-          document.execCommand('insertText', false, replyText);
-          await new Promise((r) => setTimeout(r, 100));
-
-          // Check if text was actually inserted
-          if (editable.textContent?.includes(replyText.slice(0, 20))) {
-            showToast(t('content.toast.replyFilled'));
-            return true;
-          }
-
-          // Method 2: simulate paste event (works on Lexical and React editors)
-          console.log('[X Reply Gen] execCommand failed, trying paste simulation...');
-          editable.focus();
           const dataTransfer = new DataTransfer();
           dataTransfer.setData('text/plain', replyText);
           dataTransfer.setData('text/html', replyText);
@@ -835,6 +1106,22 @@ export default defineContentScript({
 
           if (editable.textContent?.includes(replyText.slice(0, 20))) {
             showToast(t('content.toast.replyFilled'));
+            if (context) showRegenerateButton(editable, context);
+            return true;
+          }
+
+          // Method 2: execCommand fallback
+          console.log('[X Reply Gen] Paste failed, trying execCommand...');
+          editable.focus();
+          await new Promise((r) => setTimeout(r, 100));
+          document.execCommand('selectAll', false);
+          await new Promise((r) => setTimeout(r, 50));
+          document.execCommand('insertText', false, replyText);
+          await new Promise((r) => setTimeout(r, 100));
+
+          if (editable.textContent?.includes(replyText.slice(0, 20))) {
+            showToast(t('content.toast.replyFilled'));
+            if (context) showRegenerateButton(editable, context);
             return true;
           }
 
@@ -874,6 +1161,7 @@ export default defineContentScript({
 
           if (editable.textContent?.includes(replyText.slice(0, 20))) {
             showToast(t('content.toast.replyFilled'));
+            if (context) showRegenerateButton(editable, context);
             return true;
           }
 
@@ -882,7 +1170,7 @@ export default defineContentScript({
           return false;
         }
 
-        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setTimeout(r, 250));
       }
 
       showToast(t('content.toast.couldNotFindCommentBox'), true);
@@ -996,7 +1284,15 @@ export default defineContentScript({
             }
           }
 
-          const filled = await fillComposer(reply, 'facebook', composer);
+          const context: RegenContext = {
+            text,
+            images,
+            platform: 'facebook',
+            postEl: composer,
+            useStreaming,
+            useVariations: !!flags.variations,
+          };
+          const filled = await fillComposer(reply, 'facebook', composer, context);
           if (!filled) {
             showToast(t('content.toast.couldNotFillCommentBox'), true);
           }
@@ -1042,7 +1338,7 @@ export default defineContentScript({
           showToast(t('content.toast.couldNotReadPost'), true);
           return;
         }
-        showFactCheckPopover(btn, postText);
+        showFactCheckPopover(btn, postText, article);
       });
 
       article.appendChild(btn);
@@ -1257,7 +1553,7 @@ export default defineContentScript({
           showToast(t('content.toast.couldNotReadPost'), true);
           return;
         }
-        showFactCheckPopover(btn, postText);
+        showFactCheckPopover(btn, postText, postEl);
       });
 
       actionBar.appendChild(btn);
@@ -1269,96 +1565,108 @@ export default defineContentScript({
       }
     }
 
-    function injectXComposerButton() {
-      // Inject a small sparkle button into each visible tweet's action bar
-      const posts = document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]');
+    function injectXPostButton(postEl: HTMLElement, actionBar: Element) {
+      if (postEl.querySelector('[data-x-reply-gen="x-post-btn"]')) return;
 
-      posts.forEach((postEl) => {
-        const rect = postEl.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return;
+      const btn = document.createElement('div');
+      btn.setAttribute('role', 'button');
+      btn.setAttribute('tabindex', '0');
+      btn.setAttribute('aria-label', 'Generate AI reply');
+      btn.setAttribute('data-x-reply-gen', 'x-post-btn');
+      btn.style.cssText = 'display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; background: #1d9bf0; color: #fff; font-family: system-ui, sans-serif; user-select: none; margin-left: 8px; flex-shrink: 0; box-shadow: 0 1px 3px rgba(0,0,0,0.15);';
+      btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2L13.5 10.5L22 12L13.5 13.5L12 22L10.5 13.5L2 12L10.5 10.5Z"/></svg>';
 
-        const actionBar = postEl.querySelector('[role="group"]');
-        if (!actionBar) return;
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        btn.style.opacity = '0.5';
 
-        // Inject fact-check button (independent of AI Reply button)
-        injectFactCheckButton(postEl, actionBar);
+        try {
+          const { text } = extractPostData(postEl, 'x');
+          if (!text) {
+            showToast(t('content.toast.couldNotReadPost'), true);
+            return;
+          }
+          const parentText = findXParentText(postEl);
+          const images = extractImageUrls(postEl, 'x');
+          const flags = await browser.storage.local.get(['variations', 'streaming']);
+          const useStreaming = !!flags.streaming && !flags.variations;
 
-        if (postEl.querySelector('[data-x-reply-gen="x-post-btn"]')) return;
-
-        const btn = document.createElement('div');
-        btn.setAttribute('role', 'button');
-        btn.setAttribute('tabindex', '0');
-        btn.setAttribute('aria-label', 'Generate AI reply');
-        btn.setAttribute('data-x-reply-gen', 'x-post-btn');
-        btn.style.cssText = 'display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; background: #1d9bf0; color: #fff; font-family: system-ui, sans-serif; user-select: none; margin-left: 8px; flex-shrink: 0; box-shadow: 0 1px 3px rgba(0,0,0,0.15);';
-        btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2L13.5 10.5L22 12L13.5 13.5L12 22L10.5 13.5L2 12L10.5 10.5Z"/></svg>';
-
-        btn.addEventListener('click', async (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          btn.style.opacity = '0.5';
-
-          try {
-            const { text } = extractPostData(postEl, 'x');
-            if (!text) {
-              showToast(t('content.toast.couldNotReadPost'), true);
-              return;
-            }
-            const parentText = findXParentText(postEl);
-            const images = extractImageUrls(postEl, 'x');
-            const flags = await browser.storage.local.get(['variations', 'streaming']);
-            const useStreaming = !!flags.streaming && !flags.variations;
-
-            let reply: string;
-            if (useStreaming) {
+          let reply: string;
+          if (useStreaming) {
+            btn.style.opacity = '1';
+            reply = await streamReply(text, parentText, btn, images);
+            btn.style.opacity = '0.5';
+          } else {
+            const result = await generateReply(text, parentText, images);
+            if (Array.isArray(result)) {
               btn.style.opacity = '1';
-              reply = await streamReply(text, parentText, btn, images);
+              const picked = await new Promise<string | null>((resolve) => {
+                showVariationsPicker(result, btn, resolve);
+              });
+              if (!picked) return;
+              reply = picked;
               btn.style.opacity = '0.5';
             } else {
-              const result = await generateReply(text, parentText, images);
-              if (Array.isArray(result)) {
-                btn.style.opacity = '1';
-                const picked = await new Promise<string | null>((resolve) => {
-                  showVariationsPicker(result, btn, resolve);
-                });
-                if (!picked) return;
-                reply = picked;
-                btn.style.opacity = '0.5';
-              } else {
-                reply = result;
-              }
+              reply = result;
             }
-
-            // Click the reply button to open the composer
-            const replyBtn = postEl.querySelector('[data-testid="reply"]') as HTMLElement | null;
-            if (replyBtn) {
-              replyBtn.click();
-              await new Promise((r) => setTimeout(r, 600));
-            }
-
-            // Find and fill the composer
-            const filled = await fillComposer(reply, 'x', postEl);
-            if (!filled) {
-              showToast(t('content.toast.couldNotFillReplyBox'), true);
-            }
-          } catch (err) {
-            const message = err instanceof Error ? err.message : t('content.toast.failedToGenerate');
-            showToast(message, true);
-          } finally {
-            btn.style.opacity = '1';
           }
-        });
 
-        actionBar.appendChild(btn);
+          const replyBtn = postEl.querySelector('[data-testid="reply"]') as HTMLElement | null;
+          if (replyBtn) {
+            replyBtn.click();
+            await new Promise((r) => setTimeout(r, 600));
+          }
+
+          const context: RegenContext = {
+            text,
+            parentText,
+            images,
+            platform: 'x',
+            postEl,
+            useStreaming,
+            useVariations: !!flags.variations,
+          };
+          const filled = await fillComposer(reply, 'x', postEl, context);
+          if (!filled) {
+            showToast(t('content.toast.couldNotFillReplyBox'), true);
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : t('content.toast.failedToGenerate');
+          showToast(message, true);
+        } finally {
+          btn.style.opacity = '1';
+        }
       });
+
+      actionBar.appendChild(btn);
     }
 
-    function scanForPosts() {
-      if (platform === 'x') {
-        injectXComposerButton();
-        document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]').forEach((el) => monitorPost(el, 'x'));
-      } else {
-        // Facebook — inject AI Reply buttons in visible comment composers
+    function processXPost(postEl: HTMLElement) {
+      const rect = postEl.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      const actionBar = postEl.querySelector('[role="group"]');
+      if (!actionBar) return;
+      injectFactCheckButton(postEl, actionBar);
+      injectXPostButton(postEl, actionBar);
+      monitorPost(postEl, 'x');
+      const { text } = extractPostData(postEl, 'x');
+      if (text) renderFactCheckBadgeIfCached(postEl, text);
+    }
+
+    function processFBPost(article: HTMLElement) {
+      const rect = article.getBoundingClientRect();
+      if (rect.height < 120) return;
+      injectFactCheckFloating(article, 'facebook');
+      monitorPost(article, 'facebook');
+      const { text } = extractPostData(article, 'facebook');
+      if (text) renderFactCheckBadgeIfCached(article, text);
+    }
+
+    function scanForFBComposers() {
+      if (fbComposerScanTimer !== null) return;
+      fbComposerScanTimer = window.setTimeout(() => {
+        fbComposerScanTimer = null;
         const composerSelectors = [
           'form[role="presentation"]',
           'div[role="presentation"]',
@@ -1377,39 +1685,65 @@ export default defineContentScript({
             injectComposerButton(el);
           }
         });
+      }, 300);
+    }
 
-        // Inject fact-check buttons on top-level FB posts
-        const articles = document.querySelectorAll<HTMLElement>('[role="article"]');
-        articles.forEach((article) => {
-          if (article.parentElement?.closest('[role="article"]')) return; // skip nested (comments)
-          const rect = article.getBoundingClientRect();
-          if (rect.height < 120) return; // skip tiny stubs
-          injectFactCheckFloating(article, 'facebook');
-          monitorPost(article, 'facebook');
+    function scanForNewElements() {
+      if (platform === 'x') {
+        document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]').forEach((el) => {
+          if (!ioObserved.has(el)) {
+            ioObserved.add(el);
+            postIo.observe(el);
+          }
         });
+      } else {
+        document.querySelectorAll<HTMLElement>('[role="article"]').forEach((el) => {
+          if (el.parentElement?.closest('[role="article"]')) return;
+          if (!ioObserved.has(el)) {
+            ioObserved.add(el);
+            postIo.observe(el);
+          }
+        });
+        scanForFBComposers();
       }
     }
 
     function triggerForFocusedPost() {
-      let target: HTMLElement | null = null;
       const active = document.activeElement;
       if (active instanceof HTMLElement) {
+        const composer = active.closest('[contenteditable="true"], [data-lexical-editor="true"], textarea') as HTMLElement | null;
+        if (composer) {
+          const regen = composer.closest('form, div[role="presentation"], [data-testid="tweetTextarea_0"]')?.querySelector('[data-x-reply-gen="regen-btn"]') as HTMLElement | null;
+          if (regen) {
+            regen.click();
+            return;
+          }
+        }
+
+        let target: HTMLElement | null = null;
         if (platform === 'x') {
           target = active.closest('article[data-testid="tweet"]');
         } else {
           target = active.closest('form[role="presentation"], div[role="presentation"]');
         }
-      }
-      if (!target) {
-        const articles = platform === 'x'
-          ? Array.from(document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]'))
-          : Array.from(document.querySelectorAll<HTMLElement>('form[role="presentation"], div[role="presentation"]'));
-        for (const el of articles) {
-          const rect = el.getBoundingClientRect();
-          if (rect.top >= 0 && rect.top < window.innerHeight - 100 && rect.height > 50) {
-            target = el;
-            break;
+        if (target) {
+          const aiBtn = target.querySelector<HTMLElement>('[data-x-reply-gen]');
+          if (aiBtn) {
+            aiBtn.click();
+            return;
           }
+        }
+      }
+
+      let target: HTMLElement | null = null;
+      const articles = platform === 'x'
+        ? Array.from(document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]'))
+        : Array.from(document.querySelectorAll<HTMLElement>('form[role="presentation"], div[role="presentation"]'));
+      for (const el of articles) {
+        const rect = el.getBoundingClientRect();
+        if (rect.top >= 0 && rect.top < window.innerHeight - 100 && rect.height > 50) {
+          target = el;
+          break;
         }
       }
       if (!target) {
@@ -1430,19 +1764,34 @@ export default defineContentScript({
       }
     });
 
-    scanForPosts();
+    scanForNewElements();
 
     const observer = new MutationObserver(() => {
-      scanForPosts();
+      scanForNewElements();
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
 
-    const interval = setInterval(scanForPosts, 2000);
+    // Lightweight periodic check to re-inject buttons that React/Lexical may have removed
+    const buttonHealthInterval = window.setInterval(() => {
+      if (platform === 'x') {
+        document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]').forEach((el) => {
+          if (!ioVisible.has(el)) return;
+          const actionBar = el.querySelector('[role="group"]');
+          if (!actionBar) return;
+          if (!actionBar.querySelector('[data-x-reply-gen]')) {
+            injectFactCheckButton(el, actionBar);
+            injectXPostButton(el, actionBar);
+          }
+        });
+      }
+    }, 3000);
 
     return () => {
       observer.disconnect();
-      clearInterval(interval);
+      postIo.disconnect();
+      window.clearInterval(buttonHealthInterval);
+      if (fbComposerScanTimer !== null) window.clearTimeout(fbComposerScanTimer);
     };
   },
 });

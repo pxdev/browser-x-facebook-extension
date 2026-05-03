@@ -1,6 +1,10 @@
 <script lang="ts" setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { t, locale, isRTL, initLocale, setLocale, type Locale } from '../../utils/i18n';
+import { providerLabels } from '../../utils/providers';
+import { loadApiKeys, saveApiKeys } from '../../utils/crypto';
+import { validateStorage } from '../../utils/schemas';
+import { sha256Hex } from '../../utils/text';
 
 const apiKeys = ref<Record<string, string>>({});
 const apiProvider = ref('kimi');
@@ -54,7 +58,7 @@ const tabs = computed<{ id: Tab; label: string }[]>(() => [
 
 interface WatchlistRow { id: number; kind: 'account' | 'keyword'; value: string; createdAt: number; unreadHits: number; lastHitTs?: number; }
 interface NarrativeHitRow { id: number; ts: number; platform: string; keyword: string; text: string; author?: string; postUrl?: string; sentimentQuick?: string; }
-interface CaptureRow { id: number; ts: number; platform: string; postUrl?: string; author?: string; text: string; notes?: string; }
+interface CaptureRow { id: number; ts: number; platform: string; postUrl?: string; author?: string; text: string; notes?: string; screenshotData?: string; }
 
 const watchlists = ref<WatchlistRow[]>([]);
 const newWatchKind = ref<'account' | 'keyword'>('keyword');
@@ -162,12 +166,6 @@ function clearCaptureSelection() {
   selectedCaptures.value = new Set();
 }
 
-async function sha256Hex(text: string): Promise<string> {
-  const enc = new TextEncoder().encode(text);
-  const hash = await crypto.subtle.digest('SHA-256', enc);
-  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
-}
-
 async function exportCapturesBrief() {
   const selected = captures.value.filter((c) => selectedCaptures.value.size === 0 || selectedCaptures.value.has(c.id));
   if (selected.length === 0) { showToast(t('captures.exportEmpty'), 'error'); return; }
@@ -234,15 +232,9 @@ function requestDeletePersona(id: string) {
   confirmTimer = window.setTimeout(() => { confirmingDeleteId.value = null; }, 3000);
 }
 
-const providers = computed(() => [
-  { value: 'kimi', label: t('providerName.kimi') },
-  { value: 'grok', label: t('providerName.grok') },
-  { value: 'openai', label: t('providerName.openai') },
-  { value: 'deepseek', label: t('providerName.deepseek') },
-  { value: 'google', label: t('providerName.google') },
-  { value: 'ollama', label: t('providerName.ollama') },
-  { value: 'custom', label: t('providerName.custom') },
-]);
+const providers = computed(() =>
+  Object.entries(providerLabels).map(([value, label]) => ({ value, label }))
+);
 
 const tones = computed(() => [
   { group: t('tone.group.calm'), items: [
@@ -335,40 +327,50 @@ const toneLabel = computed(() => {
 
 onMounted(async () => {
   await initLocale();
+
+  const keysResult = await loadApiKeys();
+  if (keysResult.keys) {
+    apiKeys.value = keysResult.keys;
+  }
+  if (keysResult.error) {
+    console.warn('[X Reply Gen] Failed to decrypt API keys:', keysResult.error);
+    showToast('API keys could not be decrypted. Please re-enter them.', 'error', 5000);
+  }
+
   const stored = await browser.storage.local.get([
-    'apiKey', 'apiKeys', 'apiProvider', 'tone', 'accent',
+    'apiProvider', 'tone', 'accent',
     'customPrompt', 'useCustomPrompt', 'monitorMode', 'keywords', 'replyLength',
     'platformX', 'platformFacebook',
     'customBaseUrl', 'customModel', 'customSupportsVision', 'variations', 'streaming',
     'personas',
     'searchEnabled', 'searchProvider', 'searchApiKey',
   ]);
-  if (stored.apiProvider) apiProvider.value = stored.apiProvider as string;
-  if (stored.apiKeys) {
-    apiKeys.value = stored.apiKeys as Record<string, string>;
-  } else if (stored.apiKey) {
-    apiKeys.value = { [apiProvider.value]: stored.apiKey as string };
-    await browser.storage.local.set({ apiKeys: apiKeys.value });
-    await browser.storage.local.remove('apiKey');
+
+  const validated = validateStorage(stored);
+  if (!validated.success) {
+    console.warn('[X Reply Gen] Storage validation failed, using defaults');
   }
-  if (stored.customBaseUrl) customBaseUrl.value = stored.customBaseUrl as string;
-  if (stored.customModel) customModel.value = stored.customModel as string;
-  if (stored.customSupportsVision !== undefined) customSupportsVision.value = stored.customSupportsVision as boolean;
-  if (stored.variations !== undefined) variations.value = stored.variations as boolean;
-  if (stored.streaming !== undefined) streaming.value = stored.streaming as boolean;
-  if (Array.isArray(stored.personas)) personas.value = stored.personas as Persona[];
-  if (stored.searchEnabled !== undefined) searchEnabled.value = stored.searchEnabled as boolean;
-  if (stored.searchProvider === 'brave' || stored.searchProvider === 'tavily') searchProvider.value = stored.searchProvider;
-  if (stored.searchApiKey) searchApiKey.value = stored.searchApiKey as string;
-  if (stored.tone) tone.value = stored.tone as string;
-  if (stored.accent) accent.value = stored.accent as string;
-  if (stored.customPrompt) customPrompt.value = stored.customPrompt as string;
-  if (stored.useCustomPrompt !== undefined) useCustomPrompt.value = stored.useCustomPrompt as boolean;
-  if (stored.monitorMode !== undefined) monitorMode.value = stored.monitorMode as boolean;
-  if (stored.keywords) keywords.value = stored.keywords as string;
-  if (stored.replyLength) replyLength.value = stored.replyLength as string;
-  if (stored.platformX !== undefined) platformX.value = stored.platformX as boolean;
-  if (stored.platformFacebook !== undefined) platformFacebook.value = stored.platformFacebook as boolean;
+  const data = validated.data;
+
+  apiProvider.value = data.apiProvider;
+  customBaseUrl.value = data.customBaseUrl || '';
+  customModel.value = data.customModel || '';
+  customSupportsVision.value = data.customSupportsVision;
+  variations.value = data.variations;
+  streaming.value = data.streaming;
+  if (Array.isArray(data.personas)) personas.value = data.personas;
+  searchEnabled.value = data.searchEnabled;
+  searchProvider.value = data.searchProvider;
+  searchApiKey.value = data.searchApiKey;
+  tone.value = data.tone;
+  accent.value = data.accent;
+  customPrompt.value = data.customPrompt || '';
+  useCustomPrompt.value = data.useCustomPrompt;
+  monitorMode.value = data.monitorMode;
+  keywords.value = data.keywords;
+  replyLength.value = data.replyLength;
+  platformX.value = data.platformX;
+  platformFacebook.value = data.platformFacebook;
 
   await Promise.all([loadWatchlists(), loadNarrativeHits(), loadCaptures()]);
 });
@@ -383,8 +385,10 @@ async function saveSettings() {
     Object.entries(apiKeys.value).map(([k, v]) => [k, (v || '').trim()])
   );
   apiKeys.value = trimmedKeys;
+
+  await saveApiKeys(trimmedKeys);
+
   await browser.storage.local.set({
-    apiKeys: trimmedKeys,
     apiProvider: apiProvider.value,
     customBaseUrl: customBaseUrl.value.trim(),
     customModel: customModel.value.trim(),
@@ -847,6 +851,7 @@ function tabHasIndicator(tabId: Tab): string | null {
                 <span class="capture-time">{{ new Date(c.ts).toLocaleString() }}</span>
                 <span v-if="c.author" class="capture-author">{{ c.author }}</span>
               </div>
+              <img v-if="c.screenshotData" :src="c.screenshotData" class="capture-thumb" alt="Screenshot" />
               <div class="capture-text">{{ c.text }}</div>
               <div class="capture-actions">
                 <a v-if="c.postUrl" :href="c.postUrl" target="_blank" rel="noopener noreferrer" class="capture-link">{{ t('captures.open') }}</a>
@@ -1635,6 +1640,14 @@ code {
   gap: 1rem;
   margin-top: 0.375rem;
   font-size: 0.75rem;
+}
+.capture-thumb {
+  max-width: 100%;
+  max-height: 180px;
+  border-radius: 8px;
+  border: 1px solid #eff3f4;
+  margin: 0.375rem 0;
+  object-fit: cover;
 }
 .capture-link { color: #1d9bf0; text-decoration: none; font-weight: 600; }
 .btn-link-danger {

@@ -1,4 +1,5 @@
 import { t } from './i18n';
+import { escapeHtml } from './text';
 import type { Platform, CaptureRow } from './db';
 
 export interface PanelTarget {
@@ -47,6 +48,7 @@ export function mountIntelPanel(deps: PanelDeps) {
   let perTab: PerTabState = {};
   let host: HTMLDivElement | null = null;
   let root: ShadowRoot | null = null;
+  let keydownHandler: ((e: KeyboardEvent) => void) | null = null;
 
   function ensureHost(): { host: HTMLDivElement; root: ShadowRoot } {
     if (host && root) return { host, root };
@@ -61,6 +63,10 @@ export function mountIntelPanel(deps: PanelDeps) {
   function close() {
     target = null;
     perTab = {};
+    if (keydownHandler) {
+      document.removeEventListener('keydown', keydownHandler, true);
+      keydownHandler = null;
+    }
     if (root) {
       const panel = root.querySelector('.panel');
       if (panel) (panel as HTMLElement).style.display = 'none';
@@ -73,6 +79,10 @@ export function mountIntelPanel(deps: PanelDeps) {
     perTab = {};
     render();
     autoLoadActiveTab();
+    const { root: r } = ensureHost();
+    const panel = r.querySelector('.panel') as HTMLElement | null;
+    const closeBtn = panel?.querySelector('.close-btn') as HTMLButtonElement | null;
+    closeBtn?.focus();
   }
 
   function setTab(tab: TabId) {
@@ -180,12 +190,6 @@ export function mountIntelPanel(deps: PanelDeps) {
     await browser.runtime.sendMessage({ type: 'CAPTURE_DELETE', id });
     perTab.captures = undefined;
     loadCaptures();
-  }
-
-  function escape(s: string): string {
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
   }
 
   function flashStatus(msg: string, isError = false) {
@@ -316,6 +320,8 @@ export function mountIntelPanel(deps: PanelDeps) {
         </div>
       `;
       panel = r.querySelector('.panel') as HTMLDivElement;
+      panel.setAttribute('role', 'dialog');
+      panel.setAttribute('aria-label', t('intel.panel.title'));
 
       panel.querySelector('.close-btn')?.addEventListener('click', close);
       panel.querySelector('.capture-btn')?.addEventListener('click', saveCurrentAsCapture);
@@ -332,21 +338,77 @@ export function mountIntelPanel(deps: PanelDeps) {
 
       const header = panel.querySelector('.header') as HTMLElement;
       let dragging = false; let startX = 0; let startY = 0; let startTop = 0; let startRight = 0;
-      header.addEventListener('mousedown', (e) => {
-        dragging = true; startX = e.clientX; startY = e.clientY;
-        const rect = panel!.getBoundingClientRect();
-        startTop = rect.top;
-        startRight = window.innerWidth - rect.right;
-        e.preventDefault();
-      });
-      document.addEventListener('mousemove', (e) => {
+      const onMouseMove = (e: MouseEvent) => {
         if (!dragging || !panel) return;
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
         panel.style.top = Math.max(0, startTop + dy) + 'px';
         panel.style.right = Math.max(0, startRight - dx) + 'px';
+      };
+      const onMouseUp = () => {
+        dragging = false;
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+      };
+      header.addEventListener('mousedown', (e) => {
+        dragging = true; startX = e.clientX; startY = e.clientY;
+        const rect = panel!.getBoundingClientRect();
+        startTop = rect.top;
+        startRight = window.innerWidth - rect.right;
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        e.preventDefault();
       });
-      document.addEventListener('mouseup', () => { dragging = false; });
+
+      if (!keydownHandler) {
+        keydownHandler = (e: KeyboardEvent) => {
+          if (!target) return;
+          const panelEl = root?.querySelector('.panel') as HTMLElement | null;
+          if (!panelEl || panelEl.style.display === 'none') return;
+
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            close();
+            return;
+          }
+
+          if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            const tabs = Array.from(panelEl.querySelectorAll<HTMLDivElement>('.tab'));
+            const focused = root?.activeElement ?? document.activeElement;
+            if (focused && tabs.includes(focused as HTMLDivElement)) {
+              e.preventDefault();
+              const idx = tabs.indexOf(focused as HTMLDivElement);
+              const nextIdx = e.key === 'ArrowLeft'
+                ? (idx - 1 + tabs.length) % tabs.length
+                : (idx + 1) % tabs.length;
+              tabs[nextIdx].focus();
+              setTab(tabs[nextIdx].dataset.tab as TabId);
+            }
+          }
+
+          if (e.key === 'Tab') {
+            const focusable = panelEl.querySelectorAll<HTMLElement>(
+              'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+            );
+            const focusableArray = Array.from(focusable).filter((el) => {
+              const style = window.getComputedStyle(el);
+              return style.display !== 'none' && style.visibility !== 'hidden';
+            });
+            if (focusableArray.length === 0) return;
+            const first = focusableArray[0];
+            const last = focusableArray[focusableArray.length - 1];
+            const focused = root?.activeElement ?? document.activeElement;
+            if (e.shiftKey && focused === first) {
+              e.preventDefault();
+              last.focus();
+            } else if (!e.shiftKey && focused === last) {
+              e.preventDefault();
+              first.focus();
+            }
+          }
+        };
+        document.addEventListener('keydown', keydownHandler, true);
+      }
     }
 
     panel.style.display = 'flex';
@@ -364,6 +426,7 @@ export function mountIntelPanel(deps: PanelDeps) {
       const id = el.dataset.tab as TabId;
       el.textContent = tabLabels[id];
       el.classList.toggle('active', id === activeTab);
+      el.setAttribute('tabindex', '0');
     });
 
     const captureBtn = panel.querySelector('.capture-btn') as HTMLButtonElement;
@@ -384,15 +447,15 @@ export function mountIntelPanel(deps: PanelDeps) {
   function renderClaims(body: HTMLDivElement) {
     const s = perTab.claims;
     if (!s || s.loading) { body.innerHTML = `<div class="empty"><span class="spinner"></span> ${t('intel.loading')}</div>`; return; }
-    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escape(s.error)}</div>`; return; }
+    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escapeHtml(s.error)}</div>`; return; }
     if (!s.rows?.length) { body.innerHTML = `<div class="empty">${t('intel.claims.empty')}</div>`; return; }
     body.innerHTML = s.rows.map((c, i) => `
       <div class="claim-row" data-i="${i}">
-        <div>${escape(c.text)}</div>
+        <div>${escapeHtml(c.text)}</div>
         <div class="claim-meta">
-          <span class="chip ${c.type}">${escape(c.type)}</span>
-          <span class="chip conf-${c.confidence}">${escape(c.confidence)}</span>
-          ${c.type === 'factual' ? `<button class="btn fc-btn" data-i="${i}" style="margin-left:auto;font-size:11px;padding:3px 8px;">${escape(t('intel.claims.factCheck'))}</button>` : ''}
+          <span class="chip ${c.type}">${escapeHtml(c.type)}</span>
+          <span class="chip conf-${c.confidence}">${escapeHtml(c.confidence)}</span>
+          ${c.type === 'factual' ? `<button class="btn fc-btn" data-i="${i}" style="margin-left:auto;font-size:11px;padding:3px 8px;">${escapeHtml(t('intel.claims.factCheck'))}</button>` : ''}
         </div>
       </div>
     `).join('');
@@ -409,13 +472,13 @@ export function mountIntelPanel(deps: PanelDeps) {
   function renderReplies(body: HTMLDivElement) {
     const s = perTab.replies;
     if (!s || s.loading) { body.innerHTML = `<div class="empty"><span class="spinner"></span> ${t('intel.loading')}</div>`; return; }
-    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escape(s.error)}</div>`; return; }
+    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escapeHtml(s.error)}</div>`; return; }
     const sent = s.sentiment;
     if (!sent) { body.innerHTML = `<div class="empty">${t('intel.replies.noData')}</div>`; return; }
     const total = sent.positive + sent.negative + sent.neutral + sent.hostile || 1;
     const seg = (n: number, color: string, label: string) => `
       <div class="legend-row">
-        <span><span class="swatch" style="background:${color};"></span>${escape(label)}</span>
+        <span><span class="swatch" style="background:${color};"></span>${escapeHtml(label)}</span>
         <span><b>${n}</b> <span style="color:#71767b;">${Math.round((n / total) * 100)}%</span></span>
       </div>`;
     const ringStyle = `background: conic-gradient(
@@ -424,10 +487,10 @@ export function mountIntelPanel(deps: PanelDeps) {
       #ffb700 ${((sent.positive + sent.neutral) / total) * 360}deg ${((sent.positive + sent.neutral + sent.negative) / total) * 360}deg,
       #f4212e ${((sent.positive + sent.neutral + sent.negative) / total) * 360}deg 360deg);`;
     const topicsHtml = (s.topics || []).map((tc) => `
-      <div class="topic-row"><span>${escape(tc.label)}</span><b>${tc.count}</b></div>
+      <div class="topic-row"><span>${escapeHtml(tc.label)}</span><b>${tc.count}</b></div>
     `).join('');
     body.innerHTML = `
-      <div style="font-size:11px;color:#536471;margin-bottom:8px;">${escape(t('intel.replies.sampled', { n: s.sampled ?? 0 }))}</div>
+      <div style="font-size:11px;color:#536471;margin-bottom:8px;">${escapeHtml(t('intel.replies.sampled', { n: s.sampled ?? 0 }))}</div>
       <div class="donut-wrap">
         <div style="width:96px;height:96px;border-radius:50%;${ringStyle};position:relative;">
           <div style="position:absolute;inset:18px;background:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;color:#536471;font-weight:700;">${total}</div>
@@ -439,7 +502,7 @@ export function mountIntelPanel(deps: PanelDeps) {
           ${seg(sent.hostile, '#f4212e', t('intel.replies.hostile'))}
         </div>
       </div>
-      <div style="font-size:10px;font-weight:700;color:#536471;text-transform:uppercase;letter-spacing:0.5px;margin:12px 0 6px;">${escape(t('intel.replies.topics'))}</div>
+      <div style="font-size:10px;font-weight:700;color:#536471;text-transform:uppercase;letter-spacing:0.5px;margin:12px 0 6px;">${escapeHtml(t('intel.replies.topics'))}</div>
       ${topicsHtml || `<div class="empty">${t('intel.replies.noTopics')}</div>`}
     `;
   }
@@ -447,21 +510,21 @@ export function mountIntelPanel(deps: PanelDeps) {
   function renderAccount(body: HTMLDivElement) {
     const s = perTab.account;
     if (!s || s.loading) { body.innerHTML = `<div class="empty"><span class="spinner"></span> ${t('intel.loading')}</div>`; return; }
-    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escape(s.error)}</div>`; return; }
+    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escapeHtml(s.error)}</div>`; return; }
     const score = s.score ?? 0;
     const f = s.features || {};
     const facts: string[] = [];
-    if (target?.author) facts.push(`<div><b>${escape(target.author)}</b>${target.authorHandle ? ` <span style="color:#71767b;">@${escape(target.authorHandle)}</span>` : ''}</div>`);
-    if (f.accountAgeDays !== undefined) facts.push(`<div>${escape(t('intel.account.ageDays', { n: f.accountAgeDays }))}</div>`);
-    if (f.followerToFollowingRatio !== undefined) facts.push(`<div>${escape(t('intel.account.ratio'))}: ${f.followerToFollowingRatio.toFixed(2)}</div>`);
-    if (f.verifiedKind) facts.push(`<div>${escape(t('intel.account.verified'))}: ${escape(f.verifiedKind)}</div>`);
+    if (target?.author) facts.push(`<div><b>${escapeHtml(target.author)}</b>${target.authorHandle ? ` <span style="color:#71767b;">@${escapeHtml(target.authorHandle)}</span>` : ''}</div>`);
+    if (f.accountAgeDays !== undefined) facts.push(`<div>${escapeHtml(t('intel.account.ageDays', { n: f.accountAgeDays }))}</div>`);
+    if (f.followerToFollowingRatio !== undefined) facts.push(`<div>${escapeHtml(t('intel.account.ratio'))}: ${f.followerToFollowingRatio.toFixed(2)}</div>`);
+    if (f.verifiedKind) facts.push(`<div>${escapeHtml(t('intel.account.verified'))}: ${escapeHtml(f.verifiedKind)}</div>`);
     body.innerHTML = `
-      <div style="font-size:11px;color:#536471;margin-bottom:6px;">${escape(t('intel.account.disclaimer'))}</div>
+      <div style="font-size:11px;color:#536471;margin-bottom:6px;">${escapeHtml(t('intel.account.disclaimer'))}</div>
       ${facts.length ? `<div style="margin-bottom:10px;font-size:12px;line-height:1.6;">${facts.join('')}</div>` : ''}
-      <div style="font-size:10px;font-weight:700;color:#536471;text-transform:uppercase;letter-spacing:0.5px;">${escape(t('intel.account.signalScore'))}: ${score}/100</div>
+      <div style="font-size:10px;font-weight:700;color:#536471;text-transform:uppercase;letter-spacing:0.5px;">${escapeHtml(t('intel.account.signalScore'))}: ${score}/100</div>
       <div class="score-bar"><div style="width:${score}%;"></div></div>
       ${(s.signals || []).length
-        ? (s.signals || []).map((sig) => `<div class="signal-row">${escape(sig)}</div>`).join('')
+        ? (s.signals || []).map((sig) => `<div class="signal-row">${escapeHtml(sig)}</div>`).join('')
         : `<div class="empty">${t('intel.account.noSignals')}</div>`}
     `;
   }
@@ -469,7 +532,7 @@ export function mountIntelPanel(deps: PanelDeps) {
   function renderCaptures(body: HTMLDivElement) {
     const s = perTab.captures;
     if (!s || s.loading) { body.innerHTML = `<div class="empty"><span class="spinner"></span> ${t('intel.loading')}</div>`; return; }
-    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escape(s.error)}</div>`; return; }
+    if (s.error) { body.innerHTML = `<div class="empty" style="color:#f4212e;">${escapeHtml(s.error)}</div>`; return; }
     if (!s.rows?.length) { body.innerHTML = `<div class="empty">${t('intel.captures.empty')}</div>`; return; }
     body.innerHTML = s.rows.map((row) => {
       const d = new Date(row.ts);
@@ -477,12 +540,12 @@ export function mountIntelPanel(deps: PanelDeps) {
       return `
       <div class="capture-row" data-id="${row.id}">
         <div class="capture-meta">
-          <span>${escape(row.platform)} · ${escape(dateStr)}${row.author ? ` · ${escape(row.author)}` : ''}</span>
+          <span>${escapeHtml(row.platform)} · ${escapeHtml(dateStr)}${row.author ? ` · ${escapeHtml(row.author)}` : ''}</span>
         </div>
-        <div class="capture-text">${escape(row.text)}</div>
+        <div class="capture-text">${escapeHtml(row.text)}</div>
         <div class="row-actions">
-          ${row.postUrl ? `<a class="btn" href="${escape(row.postUrl)}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">${escape(t('intel.captures.open'))}</a>` : ''}
-          <button class="btn danger del-btn" data-id="${row.id}">${escape(t('intel.captures.delete'))}</button>
+          ${row.postUrl ? `<a class="btn" href="${escapeHtml(row.postUrl)}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">${escapeHtml(t('intel.captures.open'))}</a>` : ''}
+          <button class="btn danger del-btn" data-id="${row.id}">${escapeHtml(t('intel.captures.delete'))}</button>
         </div>
       </div>`;
     }).join('');

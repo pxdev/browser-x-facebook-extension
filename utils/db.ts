@@ -1,7 +1,7 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 
 const DB_NAME = 'x-reply-gen';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 export type Platform = 'x' | 'facebook';
 
@@ -56,6 +56,17 @@ export interface WatchlistHitRow {
   read: boolean;
 }
 
+export interface ReplyHistoryRow {
+  id?: number;
+  ts: number;
+  platform: Platform;
+  postTextHash: string;
+  reply: string;
+  tone: string;
+  accent: string;
+  provider: string;
+}
+
 interface XrgSchema extends DBSchema {
   captures: {
     key: number;
@@ -77,29 +88,60 @@ interface XrgSchema extends DBSchema {
     value: WatchlistHitRow;
     indexes: { 'by-ts': number; 'by-watchlist': number; 'by-read': string };
   };
+  replyHistory: {
+    key: number;
+    value: ReplyHistoryRow;
+    indexes: { 'by-ts': number; 'by-hash': string };
+  };
+  schemaMeta: {
+    key: string;
+    value: { key: string; value: string };
+  };
 }
+
+const migrations: Record<number, (db: IDBPDatabase<XrgSchema>) => void> = {
+  1: (db) => {
+    const captures = db.createObjectStore('captures', { keyPath: 'id', autoIncrement: true });
+    captures.createIndex('by-ts', 'ts');
+    captures.createIndex('by-platform', 'platform');
+
+    const hits = db.createObjectStore('narrativeHits', { keyPath: 'id', autoIncrement: true });
+    hits.createIndex('by-ts', 'ts');
+    hits.createIndex('by-keyword', 'keyword');
+
+    const watchlists = db.createObjectStore('watchlists', { keyPath: 'id', autoIncrement: true });
+    watchlists.createIndex('by-kind', 'kind');
+
+    const wlHits = db.createObjectStore('watchlistHits', { keyPath: 'id', autoIncrement: true });
+    wlHits.createIndex('by-ts', 'ts');
+    wlHits.createIndex('by-watchlist', 'watchlistId');
+    wlHits.createIndex('by-read', 'read' as any);
+  },
+  2: (db) => {
+    const replyHistory = db.createObjectStore('replyHistory', { keyPath: 'id', autoIncrement: true });
+    replyHistory.createIndex('by-ts', 'ts');
+    replyHistory.createIndex('by-hash', 'postTextHash');
+
+    db.createObjectStore('schemaMeta', { keyPath: 'key' });
+  },
+};
 
 let dbPromise: Promise<IDBPDatabase<XrgSchema>> | null = null;
 
 export function getDb(): Promise<IDBPDatabase<XrgSchema>> {
   if (!dbPromise) {
     dbPromise = openDB<XrgSchema>(DB_NAME, DB_VERSION, {
-      upgrade(db) {
-        const captures = db.createObjectStore('captures', { keyPath: 'id', autoIncrement: true });
-        captures.createIndex('by-ts', 'ts');
-        captures.createIndex('by-platform', 'platform');
-
-        const hits = db.createObjectStore('narrativeHits', { keyPath: 'id', autoIncrement: true });
-        hits.createIndex('by-ts', 'ts');
-        hits.createIndex('by-keyword', 'keyword');
-
-        const watchlists = db.createObjectStore('watchlists', { keyPath: 'id', autoIncrement: true });
-        watchlists.createIndex('by-kind', 'kind');
-
-        const wlHits = db.createObjectStore('watchlistHits', { keyPath: 'id', autoIncrement: true });
-        wlHits.createIndex('by-ts', 'ts');
-        wlHits.createIndex('by-watchlist', 'watchlistId');
-        wlHits.createIndex('by-read', 'read' as any);
+      upgrade(db, oldVersion) {
+        for (let v = oldVersion + 1; v <= DB_VERSION; v++) {
+          if (migrations[v]) {
+            try {
+              migrations[v](db);
+            } catch (err) {
+              console.error(`[X Reply Gen] DB migration ${v} failed:`, err);
+              throw err;
+            }
+          }
+        }
       },
     });
   }
@@ -217,4 +259,32 @@ export async function markWatchlistRead(watchlistId: number): Promise<void> {
 export async function totalUnreadHits(): Promise<number> {
   const wls = await listWatchlists();
   return wls.reduce((sum, w) => sum + (w.unreadHits ?? 0), 0);
+}
+
+// Reply history helpers
+export async function addReplyHistory(row: Omit<ReplyHistoryRow, 'id'>): Promise<number> {
+  const db = await getDb();
+  return db.add('replyHistory', row as ReplyHistoryRow);
+}
+
+export async function listReplyHistory(postTextHash?: string, limit = 50): Promise<ReplyHistoryRow[]> {
+  const db = await getDb();
+  const tx = db.transaction('replyHistory', 'readonly');
+  const out: ReplyHistoryRow[] = [];
+  if (postTextHash) {
+    const idx = tx.store.index('by-hash');
+    let cursor = await idx.openCursor(IDBKeyRange.only(postTextHash), 'prev');
+    while (cursor && out.length < limit) {
+      out.push(cursor.value);
+      cursor = await cursor.continue();
+    }
+  } else {
+    const idx = tx.store.index('by-ts');
+    let cursor = await idx.openCursor(null, 'prev');
+    while (cursor && out.length < limit) {
+      out.push(cursor.value);
+      cursor = await cursor.continue();
+    }
+  }
+  return out;
 }
